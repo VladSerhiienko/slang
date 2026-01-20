@@ -1,7 +1,7 @@
 import os
 from conan import ConanFile
 from conan.tools.cmake import CMake, cmake_layout
-from conan.tools.files import copy
+from conan.tools.files import copy, collect_libs
 
 
 class SlangConan(ConanFile):
@@ -31,6 +31,7 @@ class SlangConan(ConanFile):
         "include/*",
         "prelude/*",
         "tools/*",
+        "docs/*",
         "examples/CMakeLists.txt",  # Only the CMakeLists, not the actual example sources
         "LICENSE",
         # External dependencies needed for core compiler (not from Conan)
@@ -54,7 +55,8 @@ class SlangConan(ConanFile):
     
     # Dependency versions - matched to Slang's bundled external versions or latest compatible
     _miniz_version = "3.0.2"            # Conan latest compatible with bundled
-    _lz4_version = "1.10.0"             # external/lz4 has 1.10.0
+    _lz4_version = "1.9.4"             # external/lz4 has 1.10.0
+    # _lz4_version = "1.10.0"             # external/lz4 has 1.10.0
     _unordered_dense_version = "4.5.0"  # external/unordered_dense has 4.5.0
     # NOTE: Slang uses spirv-headers 1.5.5 with newer SPIR-V opcodes (e.g., OpRayQueryGetIntersectionClusterIdNV)
     # that are NOT available in Conan's latest packages (1.4.313.0). These must use bundled versions.
@@ -143,9 +145,9 @@ class SlangConan(ConanFile):
         "enable_release_lto": True,
         "enable_split_debug_info": True,
         # Prebuilt binaries - default ON
-        "enable_prebuilt_binaries": True,
+        "enable_prebuilt_binaries": False,
         # LLVM flavor - default to fetching binary if possible
-        "slang_llvm_flavor": "FETCH_BINARY_IF_POSSIBLE",
+        "slang_llvm_flavor": "DISABLE", # "FETCH_BINARY_IF_POSSIBLE",
         # System library options - use Conan packages where compatible
         "use_system_miniz": True,           # Use Conan package
         "use_system_lz4": True,             # Use Conan package
@@ -253,55 +255,46 @@ class SlangConan(ConanFile):
         cmake.build()
 
     def package(self):
-        # Copy license
+        # --- TOTALLY CUSTOM PACKAGING ---
+        # We ignore cmake.install() because upstream is unreliable (missing libs, docs issues).
+        # We manually grab every artifact we need.
+        
+        # 1. License
         copy(self, "LICENSE", src=self.source_folder, dst=os.path.join(self.package_folder, "licenses"))
-        
-        # Copy headers
+
+        # 2. Headers (preserve structure)
         copy(self, "*.h", src=os.path.join(self.source_folder, "include"), dst=os.path.join(self.package_folder, "include"))
-        copy(self, "slang.h", src=self.source_folder, dst=os.path.join(self.package_folder, "include"))
-        copy(self, "slang-com-ptr.h", src=self.source_folder, dst=os.path.join(self.package_folder, "include"))
-        copy(self, "slang-com-helper.h", src=self.source_folder, dst=os.path.join(self.package_folder, "include"))
-        copy(self, "slang-gfx.h", src=self.source_folder, dst=os.path.join(self.package_folder, "include"))
-        copy(self, "slang-tag-version.h", src=self.source_folder, dst=os.path.join(self.package_folder, "include"))
-        
-        # Copy prelude headers
         copy(self, "*.h", src=os.path.join(self.source_folder, "prelude"), dst=os.path.join(self.package_folder, "include", "prelude"))
-        
-        # Copy static libraries
-        copy(self, "*.a", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
-        copy(self, "*.lib", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
-        
-        # Copy shared libraries
-        copy(self, "*.so", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
-        copy(self, "*.so.*", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
-        copy(self, "*.dylib", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
+
+        # 3. Binaries (Recursive grab + Flatten)
+        # Finds slangc.exe, slangd.exe, slang-glslang.dll, etc.
+        copy(self, "*.exe", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
         copy(self, "*.dll", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
         
-        # Copy executables
-        copy(self, "*.exe", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
-        # Linux/macOS executables - copy specific binaries without extension
-        if self.settings.os != "Windows":
-            bin_folder = os.path.join(self.build_folder, "bin")
-            if os.path.exists(bin_folder):
-                for exe_name in ["slangc", "slangd", "slangi"]:
-                    copy(self, exe_name, src=bin_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
+        # 4. Libraries (Recursive grab + Flatten)
+        # Finds slang-compiler.lib, slang-rt.lib, AND slang-glslang.lib
+        copy(self, "*.lib", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
+        copy(self, "*.a",   src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False) 
+        copy(self, "*.so*", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
+        copy(self, "*.dylib", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
+        
+        # 5. Modules (Slang specific)
+        copy(self, "*.slang-module", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
 
     def package_info(self):
-        # Main slang library
-        self.cpp_info.libs = ["slang"]
+        # Automatically find all the libs we just copied (slang-compiler.lib, slang-glslang.lib, etc.)
+        self.cpp_info.libs = collect_libs(self)
         
-        # Add runtime library if enabled
-        if self.options.enable_slangrt:
-            self.cpp_info.libs.append("slang-rt")
-        
-        # Add glslang wrapper if enabled
-        if self.options.enable_slang_glslang:
-            self.cpp_info.libs.append("slang-glslang")
-        
+        # Define SLANG_STATIC if not shared
+        if not self.options.shared:
+            self.cpp_info.defines.append("SLANG_STATIC")
+            if self.settings.os == "Windows":
+                 self.cpp_info.system_libs = ["shlwapi", "d3dcompiler"]
+
         self.cpp_info.includedirs = ["include"]
         self.cpp_info.libdirs = ["lib"]
         self.cpp_info.bindirs = ["bin"]
         
-        # Add slangc to PATH for consumers
+        # Add bin folder to PATH so 'slangc' is available
         if self.options.enable_slangc:
             self.buildenv_info.prepend_path("PATH", os.path.join(self.package_folder, "bin"))
