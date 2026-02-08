@@ -188,10 +188,13 @@ class SlangConan(ConanFile):
         # as Conan packages with compatible versions. Slang requires spirv-headers 1.5.5+
         # but Conan only has up to 1.4.313.0. These must use bundled versions.
 
+    def should_require_self_tools(self):
+        return cross_building(self) and self.settings.os in ["iOS", "Android"]
+
     def build_requirements(self):
         self.tool_requires("cmake/4.0.3")
 
-        if cross_building(self) and self.settings.os in ["iOS", "Android"]:
+        if self.should_require_self_tools():
             self.output.info("Requiring Slang for cross-compilation...")
             self.tool_requires(f"{self.name}/{self.version}")
 
@@ -257,7 +260,15 @@ class SlangConan(ConanFile):
         }
 
         # If we are on iOS/Android, we need to point CMake to the host (macOS) binaries
-        if self.settings.os in ["iOS", "Android"]:
+        if self.should_require_self_tools():
+            # Ensure that the "slang" build requirement is present:
+            if "slang" not in self.dependencies.build:
+                raise RuntimeError(
+                    "Expected a build requirement named 'slang' when cross-building for "
+                    f"{self.settings.os}, but it was not found in self.dependencies.build. "
+                    "Make sure the slang tool-require is declared in build_requirements()."
+                )
+
             # Check if "slang" is present in the build requirements
             # if "slang" in self.dependencies.build:
             # Get the package folder of the tool_requirement
@@ -266,12 +277,11 @@ class SlangConan(ConanFile):
             
             # Construct the full path to /bin
             slang_bin_dir = os.path.join(slang_pkg_root, "bin")
-            self.output.info(f"Slang bin directory: {slang_bin_dir}")
             
             # Conan uses forward slashes for paths even on Windows, but good to be safe for CMake
             slang_bin_dir = slang_bin_dir.replace("\\", "/")
-            
-            self.output.info(f"Cross-compiling: Setting SLANG_GENERATORS_PATH to {slang_bin_dir}")
+            self.output.info(f"Using slang bin directory as SLANG_GENERATORS_PATH: {slang_bin_dir}")
+
             variables["SLANG_GENERATORS_PATH"] = slang_bin_dir
 
         cmake.configure(variables=variables)
