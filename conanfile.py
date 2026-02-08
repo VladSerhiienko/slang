@@ -259,7 +259,7 @@ class SlangConan(ConanFile):
             "SLANG_PROTOTYPE_DIAGNOSTICS": self.options.prototype_diagnostics,
         }
 
-        # If we are on iOS/Android, we need to point CMake to the host (macOS) binaries
+        # If we are on iOS/Android, we need to point CMake to the host/build-platform binaries
         if self.should_require_self_tools():
             # Ensure that the "slang" build requirement is present:
             if "slang" not in self.dependencies.build:
