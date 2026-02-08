@@ -193,7 +193,7 @@ class SlangConan(ConanFile):
 
         if cross_building(self) and self.settings.os in ["iOS", "Android"]:
             self.output.info("Requiring Slang for cross-compilation...")
-            self.tool_requires("slang/2025.9.2")
+            self.tool_requires(f"{self.name}/{self.version}")
 
     def layout(self):
         cmake_layout(self)
