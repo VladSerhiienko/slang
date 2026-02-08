@@ -340,7 +340,7 @@ function(slang_add_target dir type)
             )
         else()
             if(CMAKE_SYSTEM_NAME MATCHES "Darwin" OR CMAKE_SYSTEM_NAME MATCHES "iOS")
-                # macOS - use dsymutil with --flat to create separate debug file
+                # Apple platforms (macOS, iOS, etc.) - use dsymutil with --flat to create separate debug file
                 add_custom_command(
                     TARGET ${target}
                     POST_BUILD
