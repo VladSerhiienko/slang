@@ -269,8 +269,6 @@ class SlangConan(ConanFile):
                     "Make sure the slang tool-require is declared in build_requirements()."
                 )
 
-            # Check if "slang" is present in the build requirements
-            # if "slang" in self.dependencies.build:
             # Get the package folder of the tool_requirement
             slang_pkg_root = self.dependencies.build["slang"].package_folder
             self.output.info(f"Using slang package from build requirements: {slang_pkg_root}")
@@ -288,7 +286,6 @@ class SlangConan(ConanFile):
         cmake.build()
 
     def package(self):
-        # --- TOTALLY CUSTOM PACKAGING ---
         # We ignore cmake.install() because upstream is unreliable (missing libs, docs issues).
         # We manually grab every artifact we need.
         
