@@ -130,6 +130,12 @@ option(SLANG_ENABLE_IR_BREAK_ALLOC "Enable _debugUID on IR allocation")
 option(SLANG_ENABLE_ASAN "Enable ASAN (address sanitizer)")
 option(SLANG_ENABLE_COVERAGE "Enable code coverage instrumentation")
 
+option(
+    SLANG_STANDARD_MODULE_DEVELOP_BUILD
+    "Enable development build for standard modules (enables UNIT_TEST macro). Disable for release builds."
+    ON
+)
+
 option(SLANG_ENABLE_PREBUILT_BINARIES "Enable using prebuilt binaries" ON)
 option(SLANG_ENABLE_GFX "Enable gfx targets" ON)
 option(SLANG_ENABLE_SLANGD "Enable language server target" ON)
@@ -437,11 +443,14 @@ endif()
 
 if(${SLANG_USE_SYSTEM_MINIZ})
     find_package(miniz REQUIRED)
-    add_library(miniz ALIAS miniz::miniz)
+    if(NOT TARGET miniz)
+        add_library(miniz ALIAS miniz::miniz)
+    endif()
 endif()
 
 if(${SLANG_USE_SYSTEM_LZ4})
     find_package(lz4 REQUIRED)
+    # >>>>>>
     # Conan's lz4 package provides LZ4::lz4_static target
     if(TARGET LZ4::lz4_static)
         add_library(lz4_static ALIAS LZ4::lz4_static)
@@ -450,6 +459,7 @@ if(${SLANG_USE_SYSTEM_LZ4})
     else()
         message(FATAL_ERROR "Could not find LZ4 target (LZ4::lz4_static or LZ4::lz4)")
     endif()
+    # <<<<<<
 endif()
 
 if(${SLANG_USE_SYSTEM_VULKAN_HEADERS})
@@ -462,7 +472,9 @@ endif()
 
 if(${SLANG_USE_SYSTEM_GLSLANG})
     find_package(glslang REQUIRED)
-    add_library(glslang ALIAS glslang::glslang)
+    if(NOT TARGET glslang)
+        add_library(glslang ALIAS glslang::glslang)
+    endif()
 endif()
 
 add_subdirectory(external)
