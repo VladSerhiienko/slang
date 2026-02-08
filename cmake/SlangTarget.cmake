@@ -175,8 +175,10 @@ function(slang_add_target dir type)
         )
     endif()
 
-    message(STATUS "Setting MACOSX_BUNDLE property for target ${target} to FALSE")
-    set_target_properties(${target} PROPERTIES MACOSX_BUNDLE FALSE)
+    if(APPLE AND type STREQUAL "EXECUTABLE")
+        message(STATUS "Setting MACOSX_BUNDLE property for target ${target} to FALSE")
+        set_target_properties(${target} PROPERTIES MACOSX_BUNDLE FALSE)
+    endif()
 
     #
     # Set the output directory
