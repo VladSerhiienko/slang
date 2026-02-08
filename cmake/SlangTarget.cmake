@@ -175,6 +175,11 @@ function(slang_add_target dir type)
         )
     endif()
 
+    if(APPLE AND type STREQUAL "EXECUTABLE")
+        message(STATUS "Setting MACOSX_BUNDLE property for target ${target} to FALSE")
+        set_target_properties(${target} PROPERTIES MACOSX_BUNDLE FALSE)
+    endif()
+
     #
     # Set the output directory
     #
@@ -334,8 +339,8 @@ function(slang_add_target dir type)
                     COMPILE_PDB_OUTPUT_DIRECTORY "${output_dir}"
             )
         else()
-            if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
-                # macOS - use dsymutil with --flat to create separate debug file
+            if(CMAKE_SYSTEM_NAME MATCHES "Darwin" OR CMAKE_SYSTEM_NAME MATCHES "iOS")
+                # Apple platforms (macOS, iOS, etc.) - use dsymutil with --flat to create separate debug file
                 add_custom_command(
                     TARGET ${target}
                     POST_BUILD
@@ -624,6 +629,8 @@ function(slang_add_target dir type)
             ${ARGN}
             RUNTIME DESTINATION ${runtime_subdir}
             ${ARGN}
+            BUNDLE DESTINATION ${bundle_subdir}
+            ${ARGN}
             PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
             ${ARGN}
         )
@@ -672,6 +679,7 @@ endfunction()
 # path from CM_I_RD to CM_I_LD.
 set(library_subdir lib)
 set(runtime_subdir bin)
+set(bundle_subdir bin)
 
 # On Windows, because there's no RPATH, place modules in bin, next to the
 # executables which load them (by deault, CMAKE will place them in lib and

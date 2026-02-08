@@ -2,6 +2,7 @@ import os
 from conan import ConanFile
 from conan.tools.cmake import CMake, cmake_layout
 from conan.tools.files import copy, collect_libs
+from conan.tools.build import cross_building
 
 
 class SlangConan(ConanFile):
@@ -187,8 +188,15 @@ class SlangConan(ConanFile):
         # as Conan packages with compatible versions. Slang requires spirv-headers 1.5.5+
         # but Conan only has up to 1.4.313.0. These must use bundled versions.
 
+    def should_require_self_tools(self):
+        return cross_building(self) and self.settings.os in ["iOS", "Android"]
+
     def build_requirements(self):
         self.tool_requires("cmake/4.0.3")
+
+        if self.should_require_self_tools():
+            self.output.info("Requiring Slang for cross-compilation...")
+            self.tool_requires(f"{self.name}/{self.version}")
 
     def layout(self):
         cmake_layout(self)
@@ -199,59 +207,84 @@ class SlangConan(ConanFile):
         # Convert shared option to SLANG_LIB_TYPE
         lib_type = "SHARED" if self.options.shared else "STATIC"
         
-        cmake.configure(
-            variables={
-                # Library type
-                "SLANG_LIB_TYPE": lib_type,
-                "SLANG_BUILD_STATIC": not self.options.shared,
-                # Core module options
-                "SLANG_EMBED_CORE_MODULE": self.options.embed_core_module,
-                "SLANG_EMBED_CORE_MODULE_SOURCE": self.options.embed_core_module_source,
-                # Build targets
-                "SLANG_ENABLE_GFX": self.options.enable_gfx,
-                "SLANG_ENABLE_SLANG_RHI": self.options.enable_slang_rhi,
-                "SLANG_ENABLE_SLANGD": self.options.enable_slangd,
-                "SLANG_ENABLE_SLANGC": self.options.enable_slangc,
-                "SLANG_ENABLE_SLANGI": self.options.enable_slangi,
-                "SLANG_ENABLE_SLANGRT": self.options.enable_slangrt,
-                "SLANG_ENABLE_SLANG_GLSLANG": self.options.enable_slang_glslang,
-                "SLANG_ENABLE_TESTS": self.options.enable_tests,
-                "SLANG_ENABLE_EXAMPLES": self.options.enable_examples,
-                "SLANG_ENABLE_REPLAYER": self.options.enable_replayer,
-                # Code generation
-                "SLANG_ENABLE_DXIL": self.options.enable_dxil,
-                # CUDA/OptiX
-                "SLANG_ENABLE_CUDA": self.options.enable_cuda,
-                "SLANG_ENABLE_OPTIX": self.options.enable_optix,
-                # Debug/validation
-                "SLANG_ENABLE_FULL_IR_VALIDATION": self.options.enable_full_ir_validation,
-                "SLANG_ENABLE_IR_BREAK_ALLOC": self.options.enable_ir_break_alloc,
-                "SLANG_ENABLE_ASAN": self.options.enable_asan,
-                "SLANG_ENABLE_COVERAGE": self.options.enable_coverage,
-                # Release build options
-                "SLANG_ENABLE_RELEASE_DEBUG_INFO": self.options.enable_release_debug_info,
-                "SLANG_ENABLE_RELEASE_LTO": self.options.enable_release_lto,
-                "SLANG_ENABLE_SPLIT_DEBUG_INFO": self.options.enable_split_debug_info,
-                # Prebuilt binaries
-                "SLANG_ENABLE_PREBUILT_BINARIES": self.options.enable_prebuilt_binaries,
-                # LLVM flavor
-                "SLANG_SLANG_LLVM_FLAVOR": str(self.options.slang_llvm_flavor),
-                # System library options
-                "SLANG_USE_SYSTEM_MINIZ": self.options.use_system_miniz,
-                "SLANG_USE_SYSTEM_LZ4": self.options.use_system_lz4,
-                "SLANG_USE_SYSTEM_VULKAN_HEADERS": self.options.use_system_vulkan_headers,
-                "SLANG_USE_SYSTEM_SPIRV_HEADERS": self.options.use_system_spirv_headers,
-                "SLANG_USE_SYSTEM_SPIRV_TOOLS": self.options.use_system_spirv_tools,
-                "SLANG_USE_SYSTEM_GLSLANG": self.options.use_system_glslang,
-                "SLANG_USE_SYSTEM_UNORDERED_DENSE": self.options.use_system_unordered_dense,
-                # Performance options
-                "SLANG_ENABLE_SPIRV_TOOLS_MIMALLOC": self.options.enable_spirv_tools_mimalloc,
-                # Advanced options
-                "SLANG_EXCLUDE_DAWN": self.options.exclude_dawn,
-                "SLANG_EXCLUDE_TINT": self.options.exclude_tint,
-                "SLANG_PROTOTYPE_DIAGNOSTICS": self.options.prototype_diagnostics,
-            }
-        )
+        variables={
+            # Library type
+            "SLANG_LIB_TYPE": lib_type,
+            "SLANG_BUILD_STATIC": not self.options.shared,
+            # Core module options
+            "SLANG_EMBED_CORE_MODULE": self.options.embed_core_module,
+            "SLANG_EMBED_CORE_MODULE_SOURCE": self.options.embed_core_module_source,
+            # Build targets
+            "SLANG_ENABLE_GFX": self.options.enable_gfx,
+            "SLANG_ENABLE_SLANG_RHI": self.options.enable_slang_rhi,
+            "SLANG_ENABLE_SLANGD": self.options.enable_slangd,
+            "SLANG_ENABLE_SLANGC": self.options.enable_slangc,
+            "SLANG_ENABLE_SLANGI": self.options.enable_slangi,
+            "SLANG_ENABLE_SLANGRT": self.options.enable_slangrt,
+            "SLANG_ENABLE_SLANG_GLSLANG": self.options.enable_slang_glslang,
+            "SLANG_ENABLE_TESTS": self.options.enable_tests,
+            "SLANG_ENABLE_EXAMPLES": self.options.enable_examples,
+            "SLANG_ENABLE_REPLAYER": self.options.enable_replayer,
+            # Code generation
+            "SLANG_ENABLE_DXIL": self.options.enable_dxil,
+            # CUDA/OptiX
+            "SLANG_ENABLE_CUDA": self.options.enable_cuda,
+            "SLANG_ENABLE_OPTIX": self.options.enable_optix,
+            # Debug/validation
+            "SLANG_ENABLE_FULL_IR_VALIDATION": self.options.enable_full_ir_validation,
+            "SLANG_ENABLE_IR_BREAK_ALLOC": self.options.enable_ir_break_alloc,
+            "SLANG_ENABLE_ASAN": self.options.enable_asan,
+            "SLANG_ENABLE_COVERAGE": self.options.enable_coverage,
+            # Release build options
+            "SLANG_ENABLE_RELEASE_DEBUG_INFO": self.options.enable_release_debug_info,
+            "SLANG_ENABLE_RELEASE_LTO": self.options.enable_release_lto,
+            "SLANG_ENABLE_SPLIT_DEBUG_INFO": self.options.enable_split_debug_info,
+            # Prebuilt binaries
+            "SLANG_ENABLE_PREBUILT_BINARIES": self.options.enable_prebuilt_binaries,
+            # LLVM flavor
+            "SLANG_SLANG_LLVM_FLAVOR": str(self.options.slang_llvm_flavor),
+            # System library options
+            "SLANG_USE_SYSTEM_MINIZ": self.options.use_system_miniz,
+            "SLANG_USE_SYSTEM_LZ4": self.options.use_system_lz4,
+            "SLANG_USE_SYSTEM_VULKAN_HEADERS": self.options.use_system_vulkan_headers,
+            "SLANG_USE_SYSTEM_SPIRV_HEADERS": self.options.use_system_spirv_headers,
+            "SLANG_USE_SYSTEM_SPIRV_TOOLS": self.options.use_system_spirv_tools,
+            "SLANG_USE_SYSTEM_GLSLANG": self.options.use_system_glslang,
+            "SLANG_USE_SYSTEM_UNORDERED_DENSE": self.options.use_system_unordered_dense,
+            # Performance options
+            "SLANG_ENABLE_SPIRV_TOOLS_MIMALLOC": self.options.enable_spirv_tools_mimalloc,
+            # Advanced options
+            "SLANG_EXCLUDE_DAWN": self.options.exclude_dawn,
+            "SLANG_EXCLUDE_TINT": self.options.exclude_tint,
+            "SLANG_PROTOTYPE_DIAGNOSTICS": self.options.prototype_diagnostics,
+        }
+
+        # If we are on iOS/Android, we need to point CMake to the host/build-platform binaries
+        if self.should_require_self_tools():
+            # Ensure that the "slang" build requirement is present:
+            if "slang" not in self.dependencies.build:
+                raise RuntimeError(
+                    "Expected a build requirement named 'slang' when cross-building for "
+                    f"{self.settings.os}, but it was not found in self.dependencies.build. "
+                    "Make sure the slang tool-require is declared in build_requirements()."
+                )
+
+            # Check if "slang" is present in the build requirements
+            # if "slang" in self.dependencies.build:
+            # Get the package folder of the tool_requirement
+            slang_pkg_root = self.dependencies.build["slang"].package_folder
+            self.output.info(f"Using slang package from build requirements: {slang_pkg_root}")
+            
+            # Construct the full path to /bin
+            slang_bin_dir = os.path.join(slang_pkg_root, "bin")
+            
+            # Conan uses forward slashes for paths even on Windows, but good to be safe for CMake
+            slang_bin_dir = slang_bin_dir.replace("\\", "/")
+            self.output.info(f"Using slang bin directory as SLANG_GENERATORS_PATH: {slang_bin_dir}")
+
+            variables["SLANG_GENERATORS_PATH"] = slang_bin_dir
+
+        cmake.configure(variables=variables)
         cmake.build()
 
     def package(self):
@@ -268,6 +301,9 @@ class SlangConan(ConanFile):
 
         # 3. Binaries (Recursive grab + Flatten)
         # Finds slangc.exe, slangd.exe, slang-glslang.dll, etc.
+        copy(self, "*", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False, excludes=["*.*", "Makefile*"])
+
+        copy(self, "*.dwarf", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
         copy(self, "*.exe", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
         copy(self, "*.dll", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
         
@@ -296,5 +332,5 @@ class SlangConan(ConanFile):
         self.cpp_info.bindirs = ["bin"]
         
         # Add bin folder to PATH so 'slangc' is available
-        if self.options.enable_slangc:
+        if self.options.enable_slangc or self.options.enable_slangd or self.options.enable_slangrt:
             self.buildenv_info.prepend_path("PATH", os.path.join(self.package_folder, "bin"))
