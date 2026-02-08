@@ -291,9 +291,7 @@ class SlangConan(ConanFile):
 
         # 3. Binaries (Recursive grab + Flatten)
         # Finds slangc.exe, slangd.exe, slang-glslang.dll, etc.
-        # copied_binaries = 
         copy(self, "*", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False, excludes=["*.*", "Makefile*"])
-        # self.output.info(f"Copied binaries: {copied_binaries}")
 
         copy(self, "*.dwarf", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
         copy(self, "*.exe", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
