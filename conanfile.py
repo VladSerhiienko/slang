@@ -2,6 +2,7 @@ import os
 from conan import ConanFile
 from conan.tools.cmake import CMake, cmake_layout
 from conan.tools.files import copy, collect_libs
+from conan.tools.build import cross_building
 
 
 class SlangConan(ConanFile):
@@ -190,7 +191,7 @@ class SlangConan(ConanFile):
     def build_requirements(self):
         self.tool_requires("cmake/4.0.3")
 
-        if self.settings.os in ["iOS", "Android"]:
+        if cross_building(self) and self.settings.os in ["iOS", "Android"]:
             self.output.info("Requiring Slang for cross-compilation...")
             self.tool_requires("slang/2025.9.2")
 
