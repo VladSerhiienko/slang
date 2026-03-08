@@ -172,6 +172,20 @@ class SlangConan(ConanFile):
             # mimalloc for spirv-tools is Windows-only by default
             self.options.enable_spirv_tools_mimalloc = False
 
+        # Mobile/embedded platforms only need the compiler library, not executables
+        if self.settings.os in ("Android", "iOS"):
+            self.options.enable_slangc = False
+            self.options.enable_slangi = False
+            self.options.enable_slangd = False
+            self.options.enable_slangrt = False
+            self.options.enable_slang_glslang = False
+            self.options.enable_tests = False
+            self.options.enable_examples = False
+            self.options.enable_replayer = False
+            self.options.enable_gfx = False
+            self.options.enable_slang_rhi = False
+            self.options.enable_dxil = False
+
     def configure(self):
         if self.options.shared:
             self.options.rm_safe("fPIC")
