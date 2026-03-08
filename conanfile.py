@@ -8,6 +8,7 @@ from conan.tools.build import cross_building
 class SlangConan(ConanFile):
     name = "slang"
     version = "2025.9.2"
+    revision_mode = "scm"
     description = "Slang is a shading language that makes it easier to build and maintain large shader codebases in a modular and extensible fashion."
     license = "MIT"
     topics = ("shader", "compiler", "slang", "hlsl", "glsl", "spirv", "dxil", "metal")
