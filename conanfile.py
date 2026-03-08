@@ -316,7 +316,19 @@ class SlangConan(ConanFile):
 
     def package_info(self):
         # Automatically find all the libs we just copied (slang-compiler.lib, slang-glslang.lib, etc.)
-        self.cpp_info.libs = collect_libs(self)
+        # self.cpp_info.libs = ["slang"]
+        # self.cpp_info.libs = collect_libs(self)
+
+        all_libs = collect_libs(self)
+        self.output.info(f"All collected libs: {all_libs}")
+
+        # 2. Filter out the specific plugins that are MH_BUNDLE (not linkable)
+        # We keep 'slang' but remove 'slang-glsl-module' and 'slang-glslang'
+        self.cpp_info.libs = [
+            lib for lib in all_libs 
+            if "glsl-module" not in lib and "glslang" not in lib
+        ]
+        self.output.info(f"Filtered libs: {self.cpp_info.libs}")
         
         # Define SLANG_STATIC if not shared
         if not self.options.shared:
