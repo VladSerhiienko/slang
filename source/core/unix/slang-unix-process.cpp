@@ -392,6 +392,13 @@ SlangResult UnixPipeStream::write(const void* buffer, size_t length)
     Process::Flags,
     RefPtr<Process>& outProcess)
 {
+#if SLANG_ANDROID
+    // posix_spawn is not available on Android API < 28, and process spawning
+    // is not meaningful on Android.
+    SLANG_UNUSED(commandLine);
+    SLANG_UNUSED(outProcess);
+    return SLANG_E_NOT_AVAILABLE;
+#else
     const char* whatFailed = nullptr;
     int spawnResult = 0;
     pid_t childPid;
@@ -564,6 +571,7 @@ SlangResult UnixPipeStream::write(const void* buffer, size_t length)
     ::close(stderrPipe[1]);
 
     return whatFailed || spawnResult ? SLANG_FAIL : SLANG_OK;
+#endif // !SLANG_ANDROID
 }
 
 /* static */ uint64_t Process::getClockFrequency()
