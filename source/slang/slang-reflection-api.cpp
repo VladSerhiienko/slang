@@ -446,6 +446,10 @@ SLANG_API SlangTypeKind spReflectionType_GetKind(SlangReflectionType* inType)
     {
         return SLANG_TYPE_KIND_RESOURCE;
     }
+    else if (const auto subpassInputType = as<SubpassInputType>(type))
+    {
+        return SLANG_TYPE_KIND_RESOURCE;
+    }
     else if (const auto feedbackType = as<FeedbackType>(type))
     {
         return SLANG_TYPE_KIND_FEEDBACK;
@@ -832,6 +836,12 @@ SLANG_API SlangResourceShape spReflectionType_GetResourceShape(SlangReflectionTy
         return textureType->getShape();
     }
 
+    if (auto subpassInputType = as<SubpassInputType>(type))
+    {
+        return subpassInputType->isMultisample() ? SLANG_TEXTURE_SUBPASS_MULTISAMPLE
+                                                 : SLANG_TEXTURE_SUBPASS;
+    }
+
     // TODO: need a better way to handle this stuff...
 #define CASE(TYPE, SHAPE, ACCESS) \
     else if (as<TYPE>(type)) do   \
@@ -879,6 +889,11 @@ SLANG_API SlangResourceAccess spReflectionType_GetResourceAccess(SlangReflection
     if (auto textureType = as<TextureTypeBase>(type))
     {
         return textureType->getAccess();
+    }
+
+    if (as<SubpassInputType>(type))
+    {
+        return SLANG_RESOURCE_ACCESS_READ;
     }
 
     // TODO: need a better way to handle this stuff...
@@ -1223,6 +1238,11 @@ SLANG_API SlangReflectionType* spReflectionType_GetResourceResultType(SlangRefle
     if (auto textureType = as<TextureTypeBase>(type))
     {
         return convert(textureType->getElementType());
+    }
+
+    if (auto subpassInputType = as<SubpassInputType>(type))
+    {
+        return convert(subpassInputType->getElementType());
     }
 
     // TODO: need a better way to handle this stuff...
@@ -4294,7 +4314,6 @@ SLANG_API void spReflectionEntryPoint_getComputeThreadGroupSize(
     auto astBuilder = entryPointLayout->program->getLinkage()->getASTBuilder();
     SLANG_AST_BUILDER_RAII(astBuilder);
 
-    // First look for the HLSL case, where we have an attribute attached to the entry point function
     auto numThreadsAttribute = entryPointFunc.getDecl()->findModifier<NumThreadsAttribute>();
     if (numThreadsAttribute)
     {
@@ -4603,6 +4622,14 @@ SLANG_API size_t spReflection_getGlobalConstantBufferSize(SlangReflection* inPro
     if (!uniform)
         return 0;
     return getReflectionSize(uniform->count);
+}
+
+SLANG_API SlangInt spReflection_getBindlessSpaceIndex(SlangReflection* inProgram)
+{
+    auto program = convert(inProgram);
+    if (!program)
+        return -1; // -1 means bindless resource heap is not used.
+    return program->bindlessSpaceIndex;
 }
 
 SLANG_API SlangReflectionType* spReflection_specializeType(
