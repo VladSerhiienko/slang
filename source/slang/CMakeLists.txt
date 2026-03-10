@@ -31,7 +31,7 @@ add_custom_command(
     OUTPUT ${SLANG_FIDDLE_OUTPUTS}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${SLANG_FIDDLE_OUTPUT_DIR}
     COMMAND
-        slang-fiddle -i "${SLANG_FIDDLE_INPUT_DIR}/" -o
+        $<TARGET_FILE:slang-fiddle> -i "${SLANG_FIDDLE_INPUT_DIR}/" -o
         "${SLANG_FIDDLE_OUTPUT_DIR}/" ${SLANG_FIDDLE_INPUT_FILE_NAMES}
     DEPENDS ${SLANG_FIDDLE_INPUTS} ${SLANG_FIDDLE_LUA_INPUTS} slang-fiddle
     WORKING_DIRECTORY ${slang_SOURCE_DIR}
@@ -69,7 +69,7 @@ add_custom_command(
     OUTPUT ${SLANG_CAPABILITY_GENERATED_SOURCE}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${SLANG_CAPABILITY_OUTPUT_DIR}
     COMMAND
-        slang-capability-generator ${SLANG_CAPABILITY_SOURCE} --target-directory
+        $<TARGET_FILE:slang-capability-generator> ${SLANG_CAPABILITY_SOURCE} --target-directory
         ${SLANG_CAPABILITY_OUTPUT_DIR} --doc
         "${slang_SOURCE_DIR}/docs/user-guide/a3-02-reference-capability-atoms.md"
     DEPENDS ${SLANG_CAPABILITY_SOURCE} slang-capability-generator
@@ -131,7 +131,7 @@ add_custom_command(
     COMMAND
         ${CMAKE_COMMAND} -E make_directory ${SLANG_LOOKUP_GENERATOR_OUTPUT_DIR}
     COMMAND
-        slang-lookup-generator ${SLANG_LOOKUP_GENERATOR_INPUT_JSON}
+        $<TARGET_FILE:slang-lookup-generator> ${SLANG_LOOKUP_GENERATOR_INPUT_JSON}
         ${SLANG_LOOKUP_GENERATED_SOURCE} "GLSLstd450" "GLSLstd450"
         "spirv/unified1/GLSL.std.450.h"
     DEPENDS ${SLANG_LOOKUP_GENERATOR_INPUT_JSON} slang-lookup-generator
@@ -149,7 +149,7 @@ add_custom_command(
     COMMAND
         ${CMAKE_COMMAND} -E make_directory ${SLANG_LOOKUP_GENERATOR_OUTPUT_DIR}
     COMMAND
-        slang-spirv-embed-generator ${SLANG_SPIRV_CORE_SOURCE_JSON}
+        $<TARGET_FILE:slang-spirv-embed-generator> ${SLANG_SPIRV_CORE_SOURCE_JSON}
         ${SLANG_SPIRV_CORE_GRAMMAR_SOURCE}
     DEPENDS ${SLANG_SPIRV_CORE_SOURCE_JSON} slang-spirv-embed-generator
     VERBATIM
