@@ -41,7 +41,7 @@ add_custom_command(
     OUTPUT ${core_module_meta_generated_headers}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${core_module_meta_output_dir}
     COMMAND
-        slang-generate ${core_module_meta_source} --target-directory
+        $<TARGET_FILE:slang-generate> ${core_module_meta_source} --target-directory
         ${core_module_meta_output_dir}
     DEPENDS ${core_module_meta_source} slang-generate
     WORKING_DIRECTORY "${core_module_meta_source_dir}"
