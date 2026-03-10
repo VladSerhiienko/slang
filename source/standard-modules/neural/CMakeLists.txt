@@ -36,7 +36,7 @@ if(SLANG_GENERATORS_PATH)
     set(SLANG_COMPILER "${SLANG_GENERATORS_PATH}/slang-bootstrap${CMAKE_HOST_EXECUTABLE_SUFFIX}")
     set(SLANG_COMPILER_DEPENDENCY)
 elseif(SLANG_ENABLE_SLANGC)
-    set(SLANG_COMPILER slangc)
+    set(SLANG_COMPILER $<TARGET_FILE:slangc>)
     set(SLANG_COMPILER_DEPENDENCY slangc)
 else()
     # As a fallback, use the system-installed `slangc` compiler
