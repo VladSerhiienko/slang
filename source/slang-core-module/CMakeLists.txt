@@ -116,7 +116,7 @@ set(glsl_module_generated_header ${glsl_module_generated_header} PARENT_SCOPE)
 add_custom_command(
     OUTPUT ${core_module_generated_header} ${glsl_module_generated_header}
     COMMAND
-        slang-bootstrap -archive-type riff-lz4 -save-core-module-bin-source
+        $<TARGET_FILE:slang-bootstrap> -archive-type riff-lz4 -save-core-module-bin-source
         ${core_module_generated_header} -save-glsl-module-bin-source
         ${glsl_module_generated_header}
     DEPENDS slang-bootstrap slang-without-embedded-core-module
