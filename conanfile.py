@@ -173,7 +173,7 @@ class SlangConan(ConanFile):
             self.options.enable_spirv_tools_mimalloc = False
 
         # Mobile/embedded platforms only need the compiler library, not executables
-        if self.settings.os in ("Android", "iOS", "Emscripten"):
+        if self.settings.os in ("Android", "iOS"):
             self.options.enable_slangc = False
             self.options.enable_slangi = False
             self.options.enable_slangd = False
@@ -203,7 +203,7 @@ class SlangConan(ConanFile):
         # but Conan only has up to 1.4.313.0. These must use bundled versions.
 
     def should_require_self_tools(self):
-        return cross_building(self) and self.settings.os in ["iOS", "Android", "Emscripten"]
+        return cross_building(self) and self.settings.os in ["iOS", "Android"]
 
     def build_requirements(self):
         self.tool_requires("cmake/4.0.3")
@@ -217,14 +217,6 @@ class SlangConan(ConanFile):
 
     def generate(self):
         tc = CMakeToolchain(self)
-        # When targeting Emscripten, chain the emsdk toolchain so CMake picks
-        # up the correct Platform/Emscripten.cmake instead of using host flags.
-        if self.settings.os == "Emscripten":
-            emscripten_root = os.environ.get("EMSCRIPTEN", "")
-            em_toolchain = os.path.join(emscripten_root, "cmake", "Modules", "Platform", "Emscripten.cmake")
-            if os.path.isfile(em_toolchain):
-                tc.user_toolchains.append(em_toolchain)
-                self.output.info(f"Chaining Emscripten toolchain: {em_toolchain}")
         tc.generate()
         deps = CMakeDeps(self)
         deps.generate()
