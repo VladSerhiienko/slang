@@ -1,6 +1,6 @@
 import os
 from conan import ConanFile
-from conan.tools.cmake import CMake, cmake_layout
+from conan.tools.cmake import CMake, CMakeToolchain, CMakeDeps, cmake_layout
 from conan.tools.files import copy, collect_libs
 from conan.tools.build import cross_building
 
@@ -16,7 +16,6 @@ class SlangConan(ConanFile):
     url = "https://github.com/shader-slang/slang"
 
     settings = "os", "compiler", "build_type", "arch"
-    generators = "CMakeToolchain", "CMakeDeps"
     
     # Minimal exports - only what's needed to build the compiler
     # Note: examples/CMakeLists.txt is needed because root CMakeLists.txt calls add_subdirectory(examples)
@@ -215,6 +214,24 @@ class SlangConan(ConanFile):
 
     def layout(self):
         cmake_layout(self)
+
+    def generate(self):
+        tc = CMakeToolchain(self)
+        # When targeting Emscripten, chain the emsdk toolchain so CMake picks
+        # up the correct Platform/Emscripten.cmake instead of using host flags.
+        # The toolchain path should come from the profile [conf] section
+        # (tools.cmake.cmaketoolchain:user_toolchain), but fall back to the
+        # EMSCRIPTEN env var if available.
+        if self.settings.os == "Emscripten":
+            emscripten_root = os.environ.get("EMSCRIPTEN", "")
+            if emscripten_root:
+                em_toolchain = os.path.join(emscripten_root, "cmake", "Modules", "Platform", "Emscripten.cmake")
+                if os.path.isfile(em_toolchain):
+                    tc.user_toolchains.append(em_toolchain)
+                    self.output.info(f"Chaining Emscripten toolchain: {em_toolchain}")
+        tc.generate()
+        deps = CMakeDeps(self)
+        deps.generate()
 
     def build(self):
         cmake = CMake(self)
