@@ -219,16 +219,12 @@ class SlangConan(ConanFile):
         tc = CMakeToolchain(self)
         # When targeting Emscripten, chain the emsdk toolchain so CMake picks
         # up the correct Platform/Emscripten.cmake instead of using host flags.
-        # The toolchain path should come from the profile [conf] section
-        # (tools.cmake.cmaketoolchain:user_toolchain), but fall back to the
-        # EMSCRIPTEN env var if available.
         if self.settings.os == "Emscripten":
             emscripten_root = os.environ.get("EMSCRIPTEN", "")
-            if emscripten_root:
-                em_toolchain = os.path.join(emscripten_root, "cmake", "Modules", "Platform", "Emscripten.cmake")
-                if os.path.isfile(em_toolchain):
-                    tc.user_toolchains.append(em_toolchain)
-                    self.output.info(f"Chaining Emscripten toolchain: {em_toolchain}")
+            em_toolchain = os.path.join(emscripten_root, "cmake", "Modules", "Platform", "Emscripten.cmake")
+            if os.path.isfile(em_toolchain):
+                tc.user_toolchains.append(em_toolchain)
+                self.output.info(f"Chaining Emscripten toolchain: {em_toolchain}")
         tc.generate()
         deps = CMakeDeps(self)
         deps.generate()
