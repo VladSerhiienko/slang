@@ -174,7 +174,7 @@ class SlangConan(ConanFile):
             self.options.enable_spirv_tools_mimalloc = False
 
         # Mobile/embedded platforms only need the compiler library, not executables
-        if self.settings.os in ("Android", "iOS"):
+        if self.settings.os in ("Android", "iOS", "Emscripten"):
             self.options.enable_slangc = False
             self.options.enable_slangi = False
             self.options.enable_slangd = False
@@ -204,7 +204,7 @@ class SlangConan(ConanFile):
         # but Conan only has up to 1.4.313.0. These must use bundled versions.
 
     def should_require_self_tools(self):
-        return cross_building(self) and self.settings.os in ["iOS", "Android"]
+        return cross_building(self) and self.settings.os in ["iOS", "Android", "Emscripten"]
 
     def build_requirements(self):
         self.tool_requires("cmake/4.0.3")
