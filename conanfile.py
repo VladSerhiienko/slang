@@ -37,6 +37,10 @@ class SlangConan(ConanFile):
         "LICENSE",
         # External dependencies needed for core compiler (not from Conan)
         "external/CMakeLists.txt",
+        # cmark-gfm (CommonMark/GFM parser). Upstream now links libcmark-gfm into
+        # the core slang library (source/slang/CMakeLists.txt) for doc-comment
+        # parsing, so it must be bundled like the other core externals.
+        "external/cmark/*",
         "external/glslang/*",
         "external/glslang-generated/*",
         "external/spirv/*",
