@@ -52,6 +52,11 @@ function(example dir)
         set(main_wrapper_libraries example-main)
     endif()
 
+    set(_optional_requires_arg "")
+    if(copy_assets_target)
+        set(_optional_requires_arg OPTIONAL_REQUIRES ${copy_assets_target})
+    endif()
+
     slang_add_target(
         .
         EXECUTABLE
@@ -68,8 +73,7 @@ function(example dir)
         EXTRA_COMPILE_DEFINITIONS_PRIVATE
             SLANG_EXAMPLE_NAME=${dir}
             $<$<BOOL:${SLANG_ENABLE_XLIB}>:SLANG_ENABLE_XLIB>
-        REQUIRED_BY all-examples
-        OPTIONAL_REQUIRES ${copy_assets_target} copy-prebuilt-binaries
+        REQUIRED_BY all-examples ${_optional_requires_arg}
         FOLDER examples
         DEBUG_DIR ${debug_dir}
         ${ARGN}
@@ -119,6 +123,8 @@ if(SLANG_ENABLE_EXAMPLES AND SLANG_ENABLE_SLANG_RHI)
     add_subdirectory(ray-tracing-pipeline)
     add_subdirectory(reflection-api)
     add_subdirectory(reflection-parameter-blocks)
+    add_subdirectory(shader-coverage-bvh-traversal)
+    add_subdirectory(shader-coverage-image-pipeline)
     add_subdirectory(shader-object)
     add_subdirectory(shader-toy)
     add_subdirectory(triangle)

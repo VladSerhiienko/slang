@@ -4,7 +4,6 @@
 #include "../core/slang-writer.h"
 #include "slang-emit-source-writer.h"
 #include "slang-ir-util.h"
-#include "slang-mangled-lexer.h"
 #include "slang-rich-diagnostics.h"
 
 #include <assert.h>
@@ -12,22 +11,6 @@
 namespace Slang
 {
 
-static const char* kHLSLBuiltInPrelude64BitCast = R"(
-uint64_t _slang_asuint64(double x)
-{
-    uint32_t low;
-    uint32_t high;
-    asuint(x, low, high);
-    return ((uint64_t)high << 32) | low;
-}
-
-double _slang_asdouble(uint64_t x)
-{
-    uint32_t low = x & 0xFFFFFFFF;
-    uint32_t high = x >> 32;
-    return asdouble(low, high);
-}
-)";
 
 void HLSLSourceEmitter::_emitHLSLDecorationSingleString(
     const char* name,
@@ -593,6 +576,112 @@ void HLSLSourceEmitter::emitEntryPointAttributesImpl(
     }
 }
 
+void HLSLSourceEmitter::emitMappedCoopVecComponentType(
+    IRInst* operand,
+    IRInst* inputInterpretationPackingFactor)
+{
+    auto intLit = cast<IRIntLit>(operand);
+
+    if (intLit->getValue() == SLANG_SCALAR_TYPE_BFLOAT16)
+    {
+        getSink()->diagnose(Diagnostics::UnsupportedTargetIntrinsic{
+            .operation = "BFloat16 cooperative vector component type",
+            .location = operand->sourceLoc});
+        m_writer->emit("0");
+        return;
+    }
+
+    IRIntegerValue inputInterpretationPackingFactorValue = 1;
+    if (inputInterpretationPackingFactor)
+    {
+        inputInterpretationPackingFactorValue =
+            cast<IRIntLit>(inputInterpretationPackingFactor)->getValue();
+    }
+
+    // SM 6.9 dx/linalg.h uses an unscoped `enum DataType` with `DATA_TYPE_*` enumerators in
+    // namespace dx::linalg (not DataType::Float16-style names).
+    m_writer->emit(m_sm610OrAbove ? "dx::linalg::ComponentType::" : "dx::linalg::");
+    m_writer->emit(getCoopVecComponentType_enum(
+        (SlangScalarType)intLit->getValue(),
+        inputInterpretationPackingFactorValue,
+        m_sm610OrAbove));
+}
+
+void HLSLSourceEmitter::emitMatrixLayoutEnum_sm609(IRInst* operand)
+{
+    SLANG_ASSERT(!m_sm610OrAbove);
+
+    const auto layout = (int32_t)cast<IRIntLit>(operand)->getValue();
+    switch (layout)
+    {
+    case SLANG_COOPERATIVE_VECTOR_MATRIX_LAYOUT_ROW_MAJOR:
+        m_writer->emit("dx::linalg::MATRIX_LAYOUT_ROW_MAJOR");
+        break;
+    case SLANG_COOPERATIVE_VECTOR_MATRIX_LAYOUT_COLUMN_MAJOR:
+        m_writer->emit("dx::linalg::MATRIX_LAYOUT_COLUMN_MAJOR");
+        break;
+    case SLANG_COOPERATIVE_VECTOR_MATRIX_LAYOUT_INFERENCING_OPTIMAL:
+        m_writer->emit("dx::linalg::MATRIX_LAYOUT_MUL_OPTIMAL");
+        break;
+    case SLANG_COOPERATIVE_VECTOR_MATRIX_LAYOUT_TRAINING_OPTIMAL:
+        m_writer->emit("dx::linalg::MATRIX_LAYOUT_OUTER_PRODUCT_OPTIMAL");
+        break;
+    default:
+        SLANG_UNEXPECTED("Unsupported cooperative vector matrix layout for HLSL emission");
+    }
+}
+
+void HLSLSourceEmitter::emitMatrixLayoutEnum_sm610(IRInst* memoryLayout, bool isTranspose)
+{
+    SLANG_ASSERT(m_sm610OrAbove);
+    const auto layout = (int32_t)cast<IRIntLit>(memoryLayout)->getValue();
+
+    m_writer->emit("dx::linalg::MatrixLayoutEnum::");
+    switch (layout)
+    {
+    case SLANG_COOPERATIVE_VECTOR_MATRIX_LAYOUT_ROW_MAJOR:
+        m_writer->emit(isTranspose ? "ColMajor" : "RowMajor");
+        break;
+    case SLANG_COOPERATIVE_VECTOR_MATRIX_LAYOUT_COLUMN_MAJOR:
+        m_writer->emit(isTranspose ? "RowMajor" : "ColMajor");
+        break;
+    case SLANG_COOPERATIVE_VECTOR_MATRIX_LAYOUT_INFERENCING_OPTIMAL:
+        m_writer->emit("MulOptimal");
+        if (isTranspose)
+            m_writer->emit("Transpose");
+        break;
+    case SLANG_COOPERATIVE_VECTOR_MATRIX_LAYOUT_TRAINING_OPTIMAL:
+        m_writer->emit("OuterProductOptimal");
+        if (isTranspose)
+            m_writer->emit("Transpose");
+        break;
+    default:
+        SLANG_UNEXPECTED("Unsupported cooperative vector matrix layout for HLSL emission");
+    }
+}
+
+void HLSLSourceEmitter::emitCoopVecMatMulBufferType(IRInst* bufferPtrInst)
+{
+    IRType* ty = bufferPtrInst->getDataType();
+    if (auto ptrTy = as<IRPtrTypeBase>(ty))
+        ty = ptrTy->getValueType();
+    emitType(ty);
+}
+
+void HLSLSourceEmitter::ensureCoopVecHlslPreludeForProfile()
+{
+    ensurePrelude("#include \"dx/linalg.h\"");
+
+    if (m_effectiveProfile.getVersion() > ProfileVersion::DX_6_9)
+    {
+        ensurePrelude(m_CoopVecPrelude_sm610);
+    }
+    else
+    {
+        ensurePrelude(m_CoopVecPrelude_sm609);
+    }
+}
+
 bool HLSLSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
 {
     auto diagnoseFloatAtommic = [&]()
@@ -780,6 +869,178 @@ bool HLSLSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
             m_writer->emit(");");
             return true;
         }
+    case kIROp_CoopMatMulAdd:
+        {
+            emitInstResultDecl(inst);
+            emitInstExpr(inst, getInfo(EmitOp::General));
+            m_writer->emit(";\n");
+            return true;
+        }
+    case kIROp_CoopVecMatMulAdd:
+        {
+            auto coopVecMatMulAdd = cast<IRCoopVecMatMulAdd>(inst);
+            auto input = coopVecMatMulAdd->getInput();
+            auto matrixPtr = coopVecMatMulAdd->getMatrixPtr();
+            auto matrixOffset = coopVecMatMulAdd->getMatrixOffset();
+            auto matrixInterpretation = coopVecMatMulAdd->getMatrixInterpretation();
+            auto biasPtr = coopVecMatMulAdd->getBiasPtr();
+            auto biasOffset = coopVecMatMulAdd->getBiasOffset();
+            auto biasInterpretation = coopVecMatMulAdd->getBiasInterpretation();
+            auto k = coopVecMatMulAdd->getK();
+            auto memoryLayout = coopVecMatMulAdd->getMemoryLayout();
+            auto transpose = coopVecMatMulAdd->getTranspose();
+            auto matrixStride = coopVecMatMulAdd->getMatrixStride();
+            bool hasBias = biasInterpretation != nullptr;
+
+            auto resultType = cast<IRCoopVectorType>(inst->getDataType());
+            auto inputType = cast<IRCoopVectorType>(input->getDataType());
+
+            const bool outputIsUnsigned = isScalarIntegerType(resultType->getElementType()) &&
+                                          !getIntTypeSigned(resultType->getElementType());
+            const bool inputIsUnsigned = isScalarIntegerType(inputType->getElementType()) &&
+                                         !getIntTypeSigned(inputType->getElementType());
+
+            ensureCoopVecHlslPreludeForProfile();
+
+            emitInstResultDecl(inst);
+            m_writer->emit(hasBias ? "__slang_linalg_MulAdd<" : "__slang_linalg_Mul<");
+            emitType(resultType->getElementType());
+            m_writer->emit(", ");
+            emitMappedCoopVecComponentType(matrixInterpretation, nullptr);
+            m_writer->emit(", ");
+            emitOperand(resultType->getElementCount(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(k, getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            if (m_sm610OrAbove)
+            {
+                emitMatrixLayoutEnum_sm610(memoryLayout, cast<IRBoolLit>(transpose)->getValue());
+            }
+            else
+            {
+                emitMatrixLayoutEnum_sm609(memoryLayout);
+                m_writer->emit(", ");
+                emitOperand(transpose, getInfo(EmitOp::General));
+            }
+            m_writer->emit(", ");
+            emitMappedCoopVecComponentType(
+                coopVecMatMulAdd->getInputInterpretation(),
+                coopVecMatMulAdd->getInputInterpretationPackingFactor());
+            // Physical HLSL vector length (e.g. 1 x uint8_t4_packed for K==4); MatK stays logical
+            // K.
+            m_writer->emit(", ");
+            emitOperand(inputType->getElementCount(), getInfo(EmitOp::General));
+            if (hasBias)
+            {
+                if (m_sm610OrAbove)
+                {
+                    m_writer->emit(", ");
+                    emitType(resultType->getElementType());
+                    m_writer->emit(", ");
+                    emitOperand(resultType->getElementCount(), getInfo(EmitOp::General));
+                }
+                else
+                {
+                    m_writer->emit(", ");
+                    emitMappedCoopVecComponentType(biasInterpretation, nullptr);
+                }
+            }
+            m_writer->emit(", ");
+            emitCoopVecMatMulBufferType(matrixPtr);
+            if (hasBias)
+            {
+                m_writer->emit(", ");
+                emitCoopVecMatMulBufferType(biasPtr);
+            }
+            m_writer->emit(", ");
+            emitType(inputType->getElementType());
+            if (!m_sm610OrAbove)
+            {
+                m_writer->emit(", ");
+                m_writer->emit(outputIsUnsigned ? "true" : "false");
+                m_writer->emit(", ");
+                m_writer->emit(inputIsUnsigned ? "true" : "false");
+            }
+            m_writer->emit(">(");
+            emitOperand(matrixPtr, getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(matrixOffset, getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(matrixStride, getInfo(EmitOp::General));
+            if (hasBias)
+            {
+                m_writer->emit(", ");
+                emitOperand(biasPtr, getInfo(EmitOp::General));
+                m_writer->emit(", ");
+                emitOperand(biasOffset, getInfo(EmitOp::General));
+            }
+            m_writer->emit(", ");
+            emitOperand(input, getInfo(EmitOp::General));
+            m_writer->emit(");\n");
+            return true;
+        }
+    case kIROp_CoopVecOuterProductAccumulate:
+        {
+            auto outerProduct = cast<IRCoopVecOuterProductAccumulate>(inst);
+            auto aType = cast<IRCoopVectorType>(outerProduct->getA()->getDataType());
+            auto bType = cast<IRCoopVectorType>(outerProduct->getB()->getDataType());
+
+            ensureCoopVecHlslPreludeForProfile();
+
+            m_writer->emit("__slang_linalg_OuterProductAccumulate<");
+            emitType(aType->getElementType());
+            m_writer->emit(", ");
+            emitMappedCoopVecComponentType(outerProduct->getMatrixInterpretation());
+            m_writer->emit(", ");
+            emitOperand(aType->getElementCount(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(bType->getElementCount(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            if (m_sm610OrAbove)
+            {
+                emitMatrixLayoutEnum_sm610(outerProduct->getMemoryLayout(), false);
+            }
+            else
+            {
+                emitMatrixLayoutEnum_sm609(outerProduct->getMemoryLayout());
+            }
+            m_writer->emit(", ");
+            emitCoopVecMatMulBufferType(outerProduct->getMatrixPtr());
+            m_writer->emit(">(");
+            emitOperand(outerProduct->getA(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(outerProduct->getB(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(outerProduct->getMatrixPtr(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(outerProduct->getMatrixOffset(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(outerProduct->getMatrixStride(), getInfo(EmitOp::General));
+            m_writer->emit(");\n");
+            return true;
+        }
+    case kIROp_CoopVecReduceSumAccumulate:
+        {
+            auto reduceSum = cast<IRCoopVecReduceSumAccumulate>(inst);
+            auto valueType = cast<IRCoopVectorType>(reduceSum->getValue()->getDataType());
+
+            ensureCoopVecHlslPreludeForProfile();
+
+            m_writer->emit("__slang_linalg_VectorAccumulate<");
+            emitType(valueType->getElementType());
+            m_writer->emit(", ");
+            emitOperand(valueType->getElementCount(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitCoopVecMatMulBufferType(reduceSum->getBufferPtr());
+            m_writer->emit(">(");
+            emitOperand(reduceSum->getValue(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(reduceSum->getBufferPtr(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(reduceSum->getOffset(), getInfo(EmitOp::General));
+            m_writer->emit(");\n");
+            return true;
+        }
     default:
         return false;
     }
@@ -787,6 +1048,12 @@ bool HLSLSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
 
 static bool isTargetHLSL2018(HLSLSourceEmitter* emitter, CapabilitySet targetCaps, Stage stage)
 {
+    if (stage == Stage::Unknown)
+    {
+        // Whole-program emission may not have an entry-point stage.
+        return !targetCaps.implies(CapabilitySet(CapabilityName::hlsl_2018));
+    }
+
     auto stageAtom = getAtomFromStage(stage);
 
     // Cache the result of this function for easier lookup.
@@ -812,9 +1079,21 @@ bool HLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
 {
     switch (inst->getOp())
     {
-    case kIROp_ControlBarrier:
+    case kIROp_SubpassLoad:
         {
-            m_writer->emit("GroupMemoryBatrierWithGroupSync();\n");
+            auto subpassLoad = as<IRSubpassLoad>(inst);
+            auto outer = getInfo(EmitOp::General);
+            emitOperand(subpassLoad->getSubpassInput(), leftSide(outer, getInfo(EmitOp::Postfix)));
+            if (auto sample = subpassLoad->getSample())
+            {
+                m_writer->emit(".SubpassLoad(");
+                emitOperand(sample, getInfo(EmitOp::General));
+                m_writer->emit(")");
+            }
+            else
+            {
+                m_writer->emit(".SubpassLoad()");
+            }
             return true;
         }
     case kIROp_MakeCoopVector:
@@ -841,13 +1120,55 @@ bool HLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
             }
             break;
         }
+    case kIROp_Add:
+    case kIROp_Sub:
+    case kIROp_Mul:
+    case kIROp_Div:
+    case kIROp_Neg:
+        if (as<IRCoopMatrixType>(inst->getDataType()))
+        {
+            ensurePrelude("#include \"dx/linalg.h\"");
+            ensurePrelude(m_CoopMatPrelude);
+            const char* funcName = nullptr;
+            switch (inst->getOp())
+            {
+            case kIROp_Add:
+                funcName = "__slang_cm_add";
+                break;
+            case kIROp_Sub:
+                funcName = "__slang_cm_sub";
+                break;
+            case kIROp_Mul:
+                funcName = "__slang_cm_mul";
+                break;
+            case kIROp_Div:
+                funcName = "__slang_cm_div";
+                break;
+            case kIROp_Neg:
+                funcName = "__slang_cm_neg";
+                break;
+            default:
+                SLANG_UNEXPECTED("Unhandled CoopMat arithmetic op");
+                break;
+            }
+            m_writer->emit(funcName);
+            m_writer->emit("(");
+            emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+            if (inst->getOp() != kIROp_Neg)
+            {
+                m_writer->emit(", ");
+                emitOperand(inst->getOperand(1), getInfo(EmitOp::General));
+            }
+            m_writer->emit(")");
+            return true;
+        }
+        break;
     case kIROp_And:
     case kIROp_Or:
         {
             // SM6.0 requires to use `and()` and `or()` functions for the logical-AND and
             // logical-OR, respectively, with non-scalar operands.
-            auto targetProfile = getTargetProgram()->getOptionSet().getProfile();
-            if (targetProfile.getVersion() < ProfileVersion::DX_6_0)
+            if (m_effectiveProfile.getVersion() < ProfileVersion::DX_6_0)
                 return false;
             auto targetCaps = getTargetReq()->getTargetCaps();
             if (!isTargetHLSL2018(this, targetCaps, m_entryPointStage))
@@ -874,8 +1195,7 @@ bool HLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
         {
             // SM6.0 requires to use `select()` instead of the ternary operator "?:" when the
             // operands are non-scalar.
-            auto targetProfile = getTargetProgram()->getOptionSet().getProfile();
-            if (targetProfile.getVersion() < ProfileVersion::DX_6_0)
+            if (m_effectiveProfile.getVersion() < ProfileVersion::DX_6_0)
                 return false;
             auto targetCaps = getTargetReq()->getTargetCaps();
             if (!isTargetHLSL2018(this, targetCaps, m_entryPointStage))
@@ -948,7 +1268,7 @@ bool HLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
                 m_writer->emit("asfloat");
                 break;
             case BaseType::Double:
-                ensurePrelude(kHLSLBuiltInPrelude64BitCast);
+                ensurePrelude(m_BuiltinPrelude64BitCast);
                 m_writer->emit("_slang_asdouble");
                 break;
             }
@@ -981,7 +1301,7 @@ bool HLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
                 closeCount++;
                 break;
             case BaseType::Double:
-                ensurePrelude(kHLSLBuiltInPrelude64BitCast);
+                ensurePrelude(m_BuiltinPrelude64BitCast);
                 m_writer->emit("_slang_asuint64(");
                 closeCount++;
                 break;
@@ -1143,6 +1463,59 @@ bool HLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
             return true;
         }
         break;
+    case kIROp_CastFloatToInt:
+    case kIROp_CastIntToFloat:
+    case kIROp_IntCast:
+    case kIROp_FloatCast:
+        {
+            auto dataType = inst->getDataType();
+            if (auto coopMatType = as<IRCoopMatrixType>(dataType))
+            {
+                const char* componentType = getCoopMatComponentTypeName(
+                    coopMatType->getElementType()->getOp(),
+                    getSink(),
+                    inst->sourceLoc);
+
+                auto useInst = as<IRIntLit>(coopMatType->getMatrixUse());
+                SLANG_RELEASE_ASSERT(useInst && "CoopMat type operands must be literals.");
+                const char* matrixUse = getCoopMatMatrixUseName(useInst->getValue());
+
+                if (!componentType || !matrixUse)
+                {
+                    // A diagnostic was already emitted; return true to claim the
+                    // instruction as handled and prevent further processing.
+                    return true;
+                }
+
+                emitInstExpr(inst->getOperand(0), inOuterPrec);
+                m_writer->emit(".Cast<");
+                m_writer->emit(componentType);
+                m_writer->emit(",");
+                m_writer->emit(matrixUse);
+                m_writer->emit(">()");
+                return true;
+            }
+        }
+        return false;
+    case kIROp_CoopMatMulAdd:
+        {
+            auto coopMatMulAdd = cast<IRCoopMatMulAdd>(inst);
+            auto saturatingAccumulation =
+                cast<IRBoolLit>(coopMatMulAdd->getSaturatingAccumulation())->getValue();
+            SLANG_RELEASE_ASSERT(
+                !saturatingAccumulation &&
+                "Saturating accumulation is not supported for HLSL cooperative matrix.");
+            ensurePrelude("#include \"dx/linalg.h\"");
+            ensurePrelude(m_CoopMatPrelude);
+            m_writer->emit("__slang_cm_muladd(");
+            emitOperand(coopMatMulAdd->getMatA(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(coopMatMulAdd->getMatB(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(coopMatMulAdd->getMatC(), getInfo(EmitOp::General));
+            m_writer->emit(")");
+            return true;
+        }
     default:
         break;
     }
@@ -1202,8 +1575,8 @@ static bool _canEmitExport(const Profile& profile)
 {
     const auto family = profile.getFamily();
     const auto version = profile.getVersion();
-    // Is ita late enough version of shader model to output with 'export'
-    return (family == ProfileFamily::DX && version >= ProfileVersion::DX_6_1);
+    // DXC rejects pre-SM6.3 library profiles for whole-program DXIL output.
+    return (family == ProfileFamily::DX && version >= ProfileVersion::DX_6_3);
 }
 
 /* virtual */ void HLSLSourceEmitter::emitFuncDecorationsImpl(IRFunc* func)
@@ -1514,6 +1887,48 @@ void HLSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
             m_writer->emit(">");
             return;
         }
+    case kIROp_CoopMatrixType:
+        {
+            ensurePrelude("#include \"dx/linalg.h\"");
+            ensurePrelude(m_CoopMatPrelude);
+
+            auto coopMatType = (IRCoopMatrixType*)type;
+            auto scopeInst = as<IRIntLit>(coopMatType->getScope());
+            auto useInst = as<IRIntLit>(coopMatType->getMatrixUse());
+            auto rowInst = as<IRIntLit>(coopMatType->getRowCount());
+            auto colInst = as<IRIntLit>(coopMatType->getColumnCount());
+            SLANG_RELEASE_ASSERT(
+                scopeInst && useInst && rowInst && colInst &&
+                "CoopMat type operands must be literals.");
+
+            const char* componentType = getCoopMatComponentTypeName(
+                coopMatType->getElementType()->getOp(),
+                getSink(),
+                type->sourceLoc);
+            SLANG_RELEASE_ASSERT(componentType);
+
+            const char* matrixScope =
+                getCoopMatMatrixScopeName(scopeInst->getValue(), getSink(), type->sourceLoc);
+            SLANG_RELEASE_ASSERT(matrixScope);
+
+            const char* matrixUse = getCoopMatMatrixUseName(useInst->getValue());
+            SLANG_RELEASE_ASSERT(matrixUse);
+
+            IRIntegerValue rowCount = rowInst->getValue();
+            IRIntegerValue colCount = colInst->getValue();
+            m_writer->emit("dx::linalg::Matrix<");
+            m_writer->emit(componentType);
+            m_writer->emit(", ");
+            m_writer->emitInt64(rowCount);
+            m_writer->emit(", ");
+            m_writer->emitInt64(colCount);
+            m_writer->emit(", ");
+            m_writer->emit(matrixUse);
+            m_writer->emit(", ");
+            m_writer->emit(matrixScope);
+            m_writer->emit(">");
+            return;
+        }
     case kIROp_BorrowInParamType:
         {
             emitSimpleTypeImpl(as<IRBorrowInParamType>(type)->getValueType());
@@ -1579,7 +1994,8 @@ void HLSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
 
         return;
     }
-    else if (const auto untypedBufferType = as<IRUntypedBufferResourceType>(type))
+    else if (const auto untypedBufferType = as<IRUntypedBufferResourceType>(type);
+             untypedBufferType)
     {
         switch (type->getOp())
         {
@@ -1720,10 +2136,13 @@ void HLSLSourceEmitter::emitSemanticsImpl(IRInst* inst, bool allowOffsets)
         }
     }
 
-    if (auto readAccessSemantic = inst->findDecoration<IRStageReadAccessDecoration>())
-        _emitStageAccessSemantic(readAccessSemantic, "read");
-    if (auto writeAccessSemantic = inst->findDecoration<IRStageWriteAccessDecoration>())
-        _emitStageAccessSemantic(writeAccessSemantic, "write");
+    if (_shouldEmitPayloadAccessQualifiers())
+    {
+        if (auto readAccessSemantic = inst->findDecoration<IRStageReadAccessDecoration>())
+            _emitStageAccessSemantic(readAccessSemantic, "read");
+        if (auto writeAccessSemantic = inst->findDecoration<IRStageWriteAccessDecoration>())
+            _emitStageAccessSemantic(writeAccessSemantic, "write");
+    }
 
     if (auto layoutDecoration = inst->findDecoration<IRLayoutDecoration>())
     {
@@ -1762,23 +2181,22 @@ void HLSLSourceEmitter::_emitStageAccessSemantic(
     m_writer->emit(")");
 }
 
+bool HLSLSourceEmitter::_shouldEmitPayloadAccessQualifiers()
+{
+    if (m_effectiveProfile.getFamily() != ProfileFamily::DX)
+        return false;
+
+    // PAQs are required on [raypayload] struct members starting with SM 6.7.
+    return m_effectiveProfile.getVersion() >= ProfileVersion::DX_6_7;
+}
+
 void HLSLSourceEmitter::emitPostKeywordTypeAttributesImpl(IRInst* inst)
 {
 
-    // Get the target profile to determine if PAQs are supported
-    bool enablePAQs = false;
-    auto profile = getTargetProgram()->getOptionSet().getProfile();
-    if (profile.getFamily() == ProfileFamily::DX)
+    if (_shouldEmitPayloadAccessQualifiers())
     {
-        // PAQs are default in Shader Model 6.7 and above when called with `--profile lib_6_7`
-
-        auto version = profile.getVersion();
-        enablePAQs = version >= ProfileVersion::DX_6_7;
-    }
-
-    if (enablePAQs)
-    {
-        if (const auto payloadDecoration = inst->findDecoration<IRRayPayloadDecoration>())
+        if (const auto payloadDecoration = inst->findDecoration<IRRayPayloadDecoration>();
+            payloadDecoration)
         {
             m_writer->emit("[raypayload] ");
         }
@@ -1804,6 +2222,60 @@ void HLSLSourceEmitter::_emitPrefixTypeAttr(IRAttr* attr)
 
 void HLSLSourceEmitter::emitSimpleFuncParamImpl(IRParam* param)
 {
+    auto emitMeshOutputParam = [&]
+    {
+        auto modifier = param->findDecoration<IRMeshOutputDecoration>();
+        if (!modifier)
+            return false;
+
+        auto func = getParentFunc(param);
+        if (!func || !func->findDecoration<IREntryPointDecoration>())
+            return false;
+
+        // HLSL mesh-output parameter syntax is only valid on mesh entry points.
+        // Helper functions that receive mesh outputs are legalized to ordinary array params.
+        auto paramName = getName(param);
+        auto paramType = param->getDataType();
+
+        if (auto layoutDecoration = param->findDecoration<IRLayoutDecoration>())
+        {
+            auto layout = as<IRVarLayout>(layoutDecoration->getLayout());
+            SLANG_ASSERT(layout);
+
+            if (layout->usesResourceKind(LayoutResourceKind::VaryingInput) ||
+                layout->usesResourceKind(LayoutResourceKind::VaryingOutput))
+            {
+                emitInterpolationModifiers(param, paramType, layout);
+            }
+        }
+
+        const char* prefix = as<IRVerticesDecoration>(modifier)     ? "out vertices "
+                             : as<IRIndicesDecoration>(modifier)    ? "out indices "
+                             : as<IRPrimitivesDecoration>(modifier) ? "out primitives "
+                                                                    : nullptr;
+        SLANG_ASSERT(prefix && "Unhandled type of mesh output decoration");
+
+        auto valueType = paramType;
+        if (auto outType = as<IROutParamTypeBase>(valueType))
+        {
+            valueType = outType->getValueType();
+        }
+        else if (auto refType = as<IRRefParamType>(valueType))
+        {
+            valueType = refType->getValueType();
+        }
+        else if (auto constRefType = as<IRBorrowInParamType>(valueType))
+        {
+            valueType = constRefType->getValueType();
+        }
+
+        m_writer->emit(prefix);
+        emitType(valueType, paramName);
+        emitSemantics(param);
+        emitPostDeclarationAttributesForType(paramType);
+        return true;
+    };
+
     // A mesh shader input payload has it's own weird stuff going on, handled
     // in emitMeshShaderModifiers, skip this bit which will introduce an
     // invalid "groupshared" keyword.
@@ -1835,27 +2307,10 @@ void HLSLSourceEmitter::emitSimpleFuncParamImpl(IRParam* param)
         }
     }
 
-    Super::emitSimpleFuncParamImpl(param);
-}
+    if (emitMeshOutputParam())
+        return;
 
-static UnownedStringSlice _getInterpolationModifierText(IRInterpolationMode mode)
-{
-    switch (mode)
-    {
-    case IRInterpolationMode::PerVertex:
-    case IRInterpolationMode::NoInterpolation:
-        return UnownedStringSlice::fromLiteral("nointerpolation");
-    case IRInterpolationMode::NoPerspective:
-        return UnownedStringSlice::fromLiteral("noperspective");
-    case IRInterpolationMode::Linear:
-        return UnownedStringSlice::fromLiteral("linear");
-    case IRInterpolationMode::Sample:
-        return UnownedStringSlice::fromLiteral("sample");
-    case IRInterpolationMode::Centroid:
-        return UnownedStringSlice::fromLiteral("centroid");
-    default:
-        return UnownedStringSlice();
-    }
+    Super::emitSimpleFuncParamImpl(param);
 }
 
 void HLSLSourceEmitter::emitInterpolationModifiersImpl(
@@ -1873,7 +2328,7 @@ void HLSLSourceEmitter::emitInterpolationModifiersImpl(
 
         auto decoration = (IRInterpolationModeDecoration*)dd;
 
-        UnownedStringSlice modeText = _getInterpolationModifierText(decoration->getMode());
+        UnownedStringSlice modeText = getInterpolationModifier_keyword(decoration->getMode());
         if (modeText.getLength() > 0)
         {
             m_writer->emit(modeText);
@@ -1895,16 +2350,6 @@ void HLSLSourceEmitter::emitPackOffsetModifier(
 
 void HLSLSourceEmitter::emitMeshShaderModifiersImpl(IRInst* varInst)
 {
-    if (auto modifier = varInst->findDecoration<IRMeshOutputDecoration>())
-    {
-        // DXC requires that mesh payload parameters have "out" specified
-        const char* s = as<IRVerticesDecoration>(modifier)     ? "out vertices "
-                        : as<IRIndicesDecoration>(modifier)    ? "out indices "
-                        : as<IRPrimitivesDecoration>(modifier) ? "out primitives "
-                                                               : nullptr;
-        SLANG_ASSERT(s && "Unhandled type of mesh output decoration");
-        m_writer->emit(s);
-    }
     if (varInst->findDecoration<IRHLSLMeshPayloadDecoration>())
     {
         // DXC requires that mesh payload parameters have "in" specified
@@ -2002,7 +2447,7 @@ void HLSLSourceEmitter::emitFrontMatterImpl(TargetRequest*)
 
 void HLSLSourceEmitter::emitGlobalInstImpl(IRInst* inst)
 {
-    if (const auto nvapiDecor = inst->findDecoration<IRNVAPIMagicDecoration>())
+    if (const auto nvapiDecor = inst->findDecoration<IRNVAPIMagicDecoration>(); nvapiDecor)
     {
         // When emitting one of the "magic" NVAPI declarations,
         // we will wrap it in a preprocessor conditional that

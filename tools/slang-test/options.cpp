@@ -77,8 +77,12 @@ static bool _isSubCommand(const char* arg)
         "  -category <name>               Only run tests in specified category\n"
         "  -exclude <name>                Exclude tests in specified category\n"
         "  -exclude-prefix <prefix>       Exclude tests with specified path prefix\n"
-        "  -api <expr>                    Enable specific APIs (e.g., 'vk+dx12' or '+dx11')\n"
-        "  -synthesizedTestApi <expr>     Set APIs for synthesized tests\n"
+        "  -api <expr>                    Enable specific APIs, e.g. 'vk+dx12', 'all-vk',\n"
+        "                                 or '+dx11'. '+'/'-' add/remove an API; a leading\n"
+        "                                 name resets the set. Keywords: all, none,\n"
+        "                                 vk (vulkan), dx11 (d3d11), dx12 (d3d12),\n"
+        "                                 mtl (metal), cuda, cpu, llvm, wgpu (webgpu)\n"
+        "  -synthesizedTestApi <expr>     Set APIs for synthesized tests (same <expr> as -api)\n"
         "  -skip-api-detection            Skip API availability detection\n"
         "  -only-api-detection            Only run API detection and print results, then exit\n"
         "  -server-count <n>              Set number of test servers (default: 1)\n"
@@ -98,12 +102,11 @@ static bool _isSubCommand(const char* arg)
         "                                 (alphabetical for prefixes matching multiple tests)\n"
         "  -dry-run                       List tests that would be run without running them\n"
         "  -disable-retries               Disable automatic retries of failed tests\n"
-
-        // Recent Windows runtime versions started opening a dialog popup window when
-        // `abort()` is called, which breaks the CI workflow and some scripts that
-        // expect a normal termination.
-        // It can be helpful for debugging but we should ignore it for CI.
-        "  -ignore-abort-msg              Ignore abort message dialog popup on Windows\n"
+        "  -synthesize-compile-targets    Synthesize compile-only tests for all available\n"
+        "                                 backends from GPU-requiring tests, exercising\n"
+        "                                 emit paths without needing a GPU\n"
+        "  -only-synthesized             Only run synthesized compile-target tests\n"
+        "                                 (implies -synthesize-compile-targets)\n"
 
         "  -enable-debug-layers [true|false] Enable or disable Validation Layer for Vulkan\n"
         "                                 and Debug Device for DX\n"
@@ -136,6 +139,13 @@ static bool _isSubCommand(const char* arg)
     *optionsOut = Options();
 
     List<const char*> positionalArgs;
+
+    // Track whether an -api / -synthesizedTestApi option has been seen so a
+    // later name-leading expression (which resets the API set and silently
+    // discards earlier options) can be rejected. Operator-leading (+/-)
+    // expressions still accumulate.
+    bool apiOptionSeen = false;
+    bool synthesizedApiOptionSeen = false;
 
     int argCount = argc;
     char const* const* argCursor = argv;
@@ -296,6 +306,15 @@ static bool _isSubCommand(const char* arg)
         {
             optionsOut->disableRetries = true;
         }
+        else if (strcmp(arg, "-synthesize-compile-targets") == 0)
+        {
+            optionsOut->synthesizeCompileTargets = true;
+        }
+        else if (strcmp(arg, "-only-synthesized") == 0)
+        {
+            optionsOut->onlySynthesized = true;
+            optionsOut->synthesizeCompileTargets = true;
+        }
         else if (strcmp(arg, "-shuffle-seed") == 0)
         {
             if (argCursor == argEnd)
@@ -428,6 +447,23 @@ static bool _isSubCommand(const char* arg)
             }
             const char* apiList = *argCursor++;
 
+            // Each -api expression is parsed relative to the previous result,
+            // but that previous value is only kept when the expression begins
+            // with an operator ('+' or '-'). An expression that begins with an
+            // API name resets from scratch and silently discards any earlier
+            // -api. Reject that case so a later -api cannot quietly override an
+            // earlier one; combine them into one expression or lead with +/-.
+            if (apiOptionSeen && apiList[0] != '+' && apiList[0] != '-')
+            {
+                stdError.print(
+                    "error: -api expression '%s' would discard the previous -api; "
+                    "begin it with '+' or '-' to combine, or merge them into a single "
+                    "expression (eg 'vk+dx12' or 'all-vk')\n",
+                    apiList);
+                return SLANG_FAIL;
+            }
+            apiOptionSeen = true;
+
             SlangResult res = RenderApiUtil::parseApiFlags(
                 UnownedStringSlice(apiList),
                 optionsOut->enabledApis,
@@ -449,6 +485,19 @@ static bool _isSubCommand(const char* arg)
                 return SLANG_FAIL;
             }
             const char* apiList = *argCursor++;
+
+            // Same silent-override hazard as -api: a name-leading expression
+            // resets the set and discards any earlier -synthesizedTestApi.
+            if (synthesizedApiOptionSeen && apiList[0] != '+' && apiList[0] != '-')
+            {
+                stdError.print(
+                    "error: -synthesizedTestApi expression '%s' would discard the previous "
+                    "-synthesizedTestApi; begin it with '+' or '-' to combine, or merge them "
+                    "into a single expression (eg 'vk+dx12' or 'all-vk')\n",
+                    apiList);
+                return SLANG_FAIL;
+            }
+            synthesizedApiOptionSeen = true;
 
             SlangResult res = RenderApiUtil::parseApiFlags(
                 UnownedStringSlice(apiList),
@@ -494,13 +543,6 @@ static bool _isSubCommand(const char* arg)
             }
             optionsOut->capabilities.add(*argCursor++);
         }
-        else if (strcmp(arg, "-ignore-abort-msg") == 0)
-        {
-            optionsOut->ignoreAbortMsg = true;
-#ifdef _MSC_VER
-            _set_abort_behavior(0, _WRITE_ABORT_MSG);
-#endif
-        }
         else if (strcmp(arg, "-expected-failure-list") == 0)
         {
             if (argCursor == argEnd)
@@ -514,6 +556,7 @@ static bool _isSubCommand(const char* arg)
             File::readAllText(fileName, text);
             List<UnownedStringSlice> lines;
             StringUtil::split(text.getUnownedSlice(), '\n', lines);
+            int fileEntryCount = 0;
             for (auto line : lines)
             {
                 // Remove comments (everything after '#' character)
@@ -529,8 +572,13 @@ static bool _isSubCommand(const char* arg)
                 if (trimmedLine.getLength() > 0)
                 {
                     optionsOut->expectedFailureList.add(trimmedLine);
+                    fileEntryCount++;
                 }
             }
+            Options::ExpectedFailureFileInfo fileInfo;
+            fileInfo.fileName = fileName;
+            fileInfo.count = fileEntryCount;
+            optionsOut->expectedFailureFiles.add(fileInfo);
         }
         else if (strcmp(arg, "-skip-list") == 0)
         {
@@ -680,6 +728,16 @@ static bool _isSubCommand(const char* arg)
     {
         // If the test directory isn't set, use the "tests" directory
         optionsOut->testDir = String("tests/");
+    }
+
+    if (optionsOut->verbosity >= VerbosityLevel::Info &&
+        optionsOut->expectedFailureFiles.getCount() > 0)
+    {
+        stdOut.print("Expected failure lists:\n");
+        for (const auto& fileInfo : optionsOut->expectedFailureFiles)
+        {
+            stdOut.print(" - %s : %d tests\n", fileInfo.fileName.getBuffer(), fileInfo.count);
+        }
     }
 
     return SLANG_OK;

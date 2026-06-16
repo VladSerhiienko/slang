@@ -233,6 +233,9 @@ FIDDLE() namespace Slang
         saturated_cooperation_using,
         IDifferentiable,
         IDifferentiablePtr,
+        IForwardDifferentiable,
+        IBackwardDifferentiable,
+        IBwdCallable,
         NullDifferential,
         OperatorAddressOf,
         COUNT
@@ -1787,25 +1790,45 @@ FIDDLE() namespace Slang
     {
         DefaultInitializableConstructor, ///< The `IDefaultInitializable.__init()` method
 
-        DifferentialType,    ///< The `IDifferentiable.Differential` associated type requirement
-        DifferentialPtrType, ///< The `IDifferentiable.DifferentialPtr` associated type requirement
-        DZeroFunc,           ///< The `IDifferentiable.dzero` function requirement
-        DAddFunc,            ///< The `IDifferentiable.dadd` function requirement
-        DMulFunc,            ///< The `IDifferentiable.dmul` function requirement
+        DifferentialType,     ///< The `IDifferentiable.Differential` associated type requirement
+        DifferentialPairType, ///< The `IDifferentiable.DifferentialPair` associated type
+                              ///< requirement
+        DifferentialPtrType,  ///< The `IDifferentiable.DifferentialPtr` associated type requirement
+        DifferentialPtrPairType, ///< The `IDifferentiable.DifferentialPtrPair` associated type
+                                 ///< requirement
+        DZeroFunc,               ///< The `IDifferentiable.dzero` function requirement
+        DAddFunc,                ///< The `IDifferentiable.dadd` function requirement
 
-        InitLogicalFromInt, ///< The `ILogical.__init` mtehod.
-        Equals,             ///< The `ILogical.equals` mtehod.
-        LessThan,           ///< The `ILogical.lessThan` mtehod.
-        LessThanOrEquals,   ///< The `ILogical.lessThanOrEquals` mtehod.
-        Shl,                ///< The `ILogical.shl` mtehod.
-        Shr,                ///< The `ILogical.shr` mtehod.
-        BitAnd,             ///< The `ILogical.bitAnd` mtehod.
-        BitOr,              ///< The `ILogical.bitOr` mtehod.
-        BitXor,             ///< The `ILogical.bitXor` mtehod.
-        BitNot,             ///< The `ILogical.bitNot` mtehod.
-        And,                ///< The `ILogical.and` mtehod.
-        Or,                 ///< The `ILogical.or` mtehod.
-        Not,                ///< The `ILogical.not` mtehod.
+        InitLogicalFromInt, ///< The `ILogical.__init` method.
+        Equals,             ///< The `ILogical.equals` method.
+        LessThan,           ///< The `ILogical.lessThan` method.
+        LessThanOrEquals,   ///< The `ILogical.lessThanOrEquals` method.
+        Shl,                ///< The `ILogical.shl` method.
+        Shr,                ///< The `ILogical.shr` method.
+        BitAnd,             ///< The `ILogical.bitAnd` method.
+        BitOr,              ///< The `ILogical.bitOr` method.
+        BitXor,             ///< The `ILogical.bitXor` method.
+        BitNot,             ///< The `ILogical.bitNot` method.
+        And,                ///< The `ILogical.and` method.
+        Or,                 ///< The `ILogical.or` method.
+        Not,                ///< The `ILogical.not` method.
+
+        // Requirement keys for auto-diff built-in requirements
+        ForwardDerivativeFunc,  ///< The "fwd_diff" built-in associated function
+        BwdCallableContextType, ///< The "BwdCallable" built-in associated type
+        MinimalContextType,     ///< The "MinimalContext" built-in associated type
+        BwdApplyFunc,           ///< The "apply_bwd" built-in associated function
+        BwdCallableRematFunc,   ///< The "remat" built-in associated function
+        BwdCallablePropFunc,    ///< The "BwdCallable::operator()" built-in associated function
+        LegacyBackwardDerivativeFunc, ///< The "bwdDiff" built-in associated function
+
+        DifferentialWitness, ///< The `IDifferentiable.Differential : IDifferentiable` conformance
+                             ///< (the witness that the differential type is itself differentiable)
+        DifferentialPtrWitness,    ///< The `IDifferentiablePtrType.Differential :
+                                   ///< IDifferentiablePtrType` conformance
+        BwdCallableContextWitness, ///< The `IBackwardDifferentiable.BwdCallable : IBwdCallable`
+                                   ///< conformance (witness that the backward-callable context type
+                                   ///< conforms to `IBwdCallable`)
     };
 
     enum class FunctionDifferentiableLevel
@@ -1847,5 +1870,62 @@ FIDDLE() namespace Slang
         Public,
         Default = Internal,
     };
+
+    // Identifies a builtin operator recognized by the fast path. Used by `BuiltinOperatorExpr`
+    // (the checked-AST node the fast path produces) and `BuiltinOperationIntVal` (its
+    // compile-time-constant form). These mirror the builtin IR ops (see
+    // `convertToBuiltinArithmeticOp` / `lowerBuiltinOperatorExpr`); their integer values are
+    // part of the serialized/mangled form, so only append, never reorder.
+    enum class BuiltinOperationKind
+    {
+        Add,
+        Sub,
+        Mul,
+        Div,
+        Mod,
+        Neg,
+        Eql,
+        Neq,
+        Less,
+        Greater,
+        Leq,
+        Geq,
+        BitAnd,
+        BitOr,
+        BitXor,
+        BitNot,
+        Lsh,
+        Rsh,
+        Not,
+        // `?:` / `&&` / `||`. These are never produced by the fast-path `BuiltinOperatorExpr`
+        // (`?:` is not an infix operator and `&&`/`||` are short-circuiting), but a *resolved*
+        // operator call on them can still fold to a compile-time-constant `BuiltinOperationIntVal`
+        // (e.g. `cond ? N : M` in an array size). Appended after the real fast-path ops above.
+        Conditional,
+        And,
+        Or,
+        // Sentinel for "not a builtin fast-path operator". Returned by
+        // `getBuiltinOperationKindFromString` for operators the fast path does not rewrite (e.g.
+        // `&&`/`||`/`?:`). Never stored on a node and never serialized, so it is kept last.
+        Unknown,
+    };
+
+    // Whether an operator is being applied to one operand or two; disambiguates the prefix `-`
+    // (Neg) from the binary `-` (Sub) in `getBuiltinOperationKindFromString`.
+    enum class OperatorArity
+    {
+        Unary,
+        Binary,
+    };
+
+    // Operator-name text for a `BuiltinOperationKind` (e.g. `Add` -> "+"); used for `toText`
+    // and mangling so a `BuiltinOperationIntVal` is identified consistently.
+    UnownedStringSlice getBuiltinOperationOpText(BuiltinOperationKind op);
+
+    // Map an operator-name + arity to a `BuiltinOperationKind`, or `Unknown` for operators
+    // that have no builtin fast-path form (e.g. `&&`/`||`).
+    BuiltinOperationKind getBuiltinOperationKindFromString(
+        UnownedStringSlice opText,
+        OperatorArity arity);
 
 } // namespace Slang

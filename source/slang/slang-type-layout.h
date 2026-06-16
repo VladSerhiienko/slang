@@ -1264,10 +1264,10 @@ public:
     /// Holds all of the string literals that have been hashed
     StringSlicePool hashedStringLiteralPool;
 
-    /// The descriptor set/space index allocated for the bindless resource heap.
+    /// The descriptor set/space index reserved for descriptor-handle-capable targets.
     ///
-    /// Return: -1 means Bindless resources not used
-    /// Return: >= 0 means Allocated space index for the bindless resource heap
+    /// -1 means no bindless space was reserved for this program and target.
+    /// >= 0 means a stable space was allocated; it does not by itself prove post-lowering heap use.
     Int bindlessSpaceIndex = -1;
 };
 
@@ -1525,6 +1525,9 @@ struct TypeLayoutContext
     // The target request that is triggering layout
     TargetRequest* targetReq;
 
+    // Optional sink for reporting layout-time diagnostics.
+    DiagnosticSink* sink = nullptr;
+
     // A parent program layout that will establish the ordering
     // of all global generic type parameters.
     //
@@ -1542,6 +1545,12 @@ struct TypeLayoutContext
 
     // Map types to their type layout
     Dictionary<Type*, TypeLayoutResult> layoutMap;
+
+    // Recursion depth for type layout creation.
+    UInt recursionDepth = 0;
+
+    // Optional declaration used as the source location anchor for layout diagnostics.
+    Decl* layoutDeclForDiagnostics = nullptr;
 
     // Options passed to object layout
     ObjectLayoutRulesImpl::Options objectLayoutOptions;

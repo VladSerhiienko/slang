@@ -47,12 +47,143 @@ void SyntaxClassBase::destructInstanceImpl(void* instance) const
 
 /* static */ const TypeExp TypeExp::empty;
 
+bool tryGetConstantIntVal(Val* val, IntegerLiteralValue& outValue)
+{
+    auto intVal = as<IntVal>(val);
+    if (auto constantIntVal = intVal ? as<ConstantIntVal>(intVal->resolve()) : nullptr)
+    {
+        outValue = constantIntVal->getValue();
+        return true;
+    }
+    return false;
+}
+
+bool tryFindProvableDuplicateOrderIndices(
+    ConcreteIntValPack* orderPack,
+    Index& outFirstPosition,
+    Index& outSecondPosition,
+    IntegerLiteralValue& outConcreteIndex,
+    bool& outHasConcreteIndex)
+{
+    for (Index i = 0; i < orderPack->getCount(); ++i)
+    {
+        for (Index j = 0; j < i; ++j)
+        {
+            if (!orderPack->getElement(i)->equals(orderPack->getElement(j)))
+                continue;
+
+            outFirstPosition = j;
+            outSecondPosition = i;
+            outHasConcreteIndex = tryGetConstantIntVal(orderPack->getElement(i), outConcreteIndex);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool areProvablyDifferentShapeElements(Val* left, Val* right)
+{
+    IntegerLiteralValue leftValue = 0;
+    IntegerLiteralValue rightValue = 0;
+    return tryGetConstantIntVal(left, leftValue) && tryGetConstantIntVal(right, rightValue) &&
+           leftValue != rightValue;
+}
+
+bool hasAnyPotentialConcatAxis(ConcreteIntValPack* leftPack, ConcreteIntValPack* rightPack)
+{
+    SLANG_ASSERT(leftPack->getCount() == rightPack->getCount());
+    for (Index axis = 0; axis < leftPack->getCount(); ++axis)
+    {
+        bool isPossibleAxis = true;
+        for (Index i = 0; i < leftPack->getCount(); ++i)
+        {
+            if (i != axis && areProvablyDifferentShapeElements(
+                                 leftPack->getElement(i),
+                                 rightPack->getElement(i)))
+            {
+                isPossibleAxis = false;
+                break;
+            }
+        }
+        if (isPossibleAxis)
+            return true;
+    }
+    return false;
+}
+
+const char* getPackQueryName(PackQueryExpr* expr)
+{
+    if (as<FirstExpr>(expr))
+        return "__first";
+    if (as<LastExpr>(expr))
+        return "__last";
+    if (as<TrimFirstExpr>(expr))
+        return "__trimFirst";
+    if (as<TrimLastExpr>(expr))
+        return "__trimLast";
+    SLANG_UNEXPECTED("unknown PackQueryExpr subtype");
+    UNREACHABLE_RETURN("");
+}
+
+const char* getShapePackTransformName(ShapePackTransformExpr* expr)
+{
+    if (as<ShapeConcatExpr>(expr))
+        return "__shapeConcat";
+    if (as<ShapePermuteExpr>(expr))
+        return "__shapePermute";
+    if (as<ShapeSwapExpr>(expr))
+        return "__shapeSwap";
+    if (as<ShapeReduceExpr>(expr))
+        return "__shapeReduce";
+    SLANG_UNEXPECTED("unknown ShapePackTransformExpr subtype");
+    UNREACHABLE_RETURN("");
+}
+
+VariadicPackCardinality getKnownPackCardinality(Val* packOperand)
+{
+    return getPackCardinalityFromStructure(
+        packOperand,
+        [](Val* operand) { return getKnownPackCardinality(operand); });
+}
+
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!! DiagnosticSink impls !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 void printDiagnosticArg(StringBuilder& sb, Decl* decl)
 {
     if (!decl)
         return;
+    // Unwrap GenericDecl to check for constructors inside.
+    auto innerDecl = maybeGetInner(decl);
+    if (as<ConstructorDecl>(innerDecl))
+    {
+        // Print constructors as "TypeName.init" instead of the internal "$init" name.
+        // Walk up through parent chain, skipping GenericDecl wrappers, to find the
+        // containing type declaration.
+        for (auto parent = decl->parentDecl; parent; parent = parent->parentDecl)
+        {
+            if (as<GenericDecl>(parent))
+                continue;
+            if (parent->getName() && parent->getName()->text.getLength())
+            {
+                sb << getText(parent->getName()) << ".";
+            }
+            else if (auto extDecl = as<ExtensionDecl>(parent))
+            {
+                // ExtensionDecl has no name; recover the type name from targetType.
+                if (auto declRefType = as<DeclRefType>(extDecl->targetType.type))
+                {
+                    auto typeDecl = declRefType->getDeclRef().getDecl();
+                    if (typeDecl && typeDecl->getName() && typeDecl->getName()->text.getLength())
+                    {
+                        sb << getText(typeDecl->getName()) << ".";
+                    }
+                }
+            }
+            break;
+        }
+        sb << "init";
+        return;
+    }
     if (decl->getName() && decl->getName()->text.getLength())
         sb << getText(decl->getName());
     else
@@ -141,18 +272,6 @@ void printDiagnosticArg(StringBuilder& sb, ASTNodeType nodeType)
     case ASTNodeType::FuncDecl:
         sb << "function";
         break;
-    case ASTNodeType::DerivativeRequirementDecl:
-        sb << "DerivativeRequirementDecl";
-        break;
-    case ASTNodeType::ForwardDerivativeRequirementDecl:
-        sb << "ForwardDerivativeRequirementDecl";
-        break;
-    case ASTNodeType::BackwardDerivativeRequirementDecl:
-        sb << "BackwardDerivativeRequirementDecl";
-        break;
-    case ASTNodeType::DerivativeRequirementReferenceDecl:
-        sb << "DerivativeRequirementReferenceDecl";
-        break;
     case ASTNodeType::SubscriptDecl:
         sb << "__subscript";
         break;
@@ -212,6 +331,15 @@ void printDiagnosticArg(StringBuilder& sb, ASTNodeType nodeType)
         break;
     case ASTNodeType::GenericTypeConstraintDecl:
         sb << "GenericTypeConstraintDecl";
+        break;
+    case ASTNodeType::NonEmptyPackConstraintDecl:
+        sb << "NonEmptyPackConstraintDecl";
+        break;
+    case ASTNodeType::GenericVariadicPackCountConstraintDecl:
+        sb << "GenericVariadicPackCountConstraintDecl";
+        break;
+    case ASTNodeType::HasDiffTypeInfoConstraintDecl:
+        sb << "__hasDiffTypeInfo";
         break;
     case ASTNodeType::SimpleTypeDecl:
         sb << "SimpleTypeDecl";
@@ -582,11 +710,33 @@ RequirementWitness RequirementWitness::specialize(
     }
 }
 
+// TODO: Make it so we can handle a recursive lookup (don't substitute the entire
+// table at each lookup, just find the entry and make all the substitutions at once).
+//
 RequirementWitness tryLookUpRequirementWitness(
     ASTBuilder* astBuilder,
     SubtypeWitness* subtypeWitness,
     Decl* requirementKey)
 {
+    if (auto packBranchWitness = as<PackBranchSubtypeWitness>(subtypeWitness))
+    {
+        switch (getKnownPackCardinality(packBranchWitness->getPackOperand()))
+        {
+        case VariadicPackCardinality::Empty:
+            return tryLookUpRequirementWitness(
+                astBuilder,
+                packBranchWitness->getEmptyWitness(),
+                requirementKey);
+        case VariadicPackCardinality::NonEmpty:
+            return tryLookUpRequirementWitness(
+                astBuilder,
+                packBranchWitness->getNonEmptyWitness(),
+                requirementKey);
+        default:
+            return RequirementWitness();
+        }
+    }
+
     if (auto declaredSubtypeWitness = as<DeclaredSubtypeWitness>(subtypeWitness))
     {
         if (auto inheritanceDeclRef = declaredSubtypeWitness->getDeclRef().as<InheritanceDecl>())
@@ -748,16 +898,17 @@ Type* DeclRefType::create(ASTBuilder* astBuilder, DeclRef<Decl> declRef)
     }
     else if (as<ThisTypeDecl>(declRef.getDecl()))
     {
-        if (as<DirectDeclRef>(declRef.declRefBase))
-        {
-            declRef = createDefaultSubstitutionsIfNeeded(astBuilder, nullptr, declRef);
-
-            return astBuilder->getOrCreate<ThisType>(declRef.declRefBase);
-        }
-        else if (auto lookupDeclRef = as<LookupDeclRef>(declRef.declRefBase))
+        // A reference to a `ThisTypeDecl` must always be represented as a `ThisType`,
+        // never as a plain `DeclRefType`. Otherwise the same logical `This` type can
+        // exist as two distinct `Type*`s (e.g. a `ThisType` built from a `DirectDeclRef`
+        // vs. a `DeclRefType` built from a `MemberDeclRef` for a substituted interface),
+        // breaking type-identity comparison. See issue #11465.
+        if (auto lookupDeclRef = as<LookupDeclRef>(declRef.declRefBase))
         {
             return lookupDeclRef->getWitness()->getSub();
         }
+        declRef = createDefaultSubstitutionsIfNeeded(astBuilder, nullptr, declRef);
+        return astBuilder->getOrCreate<ThisType>(declRef.declRefBase);
     }
     else if (auto typedefDecl = as<TypeDefDecl>(declRef.getDecl()))
     {
@@ -893,6 +1044,37 @@ NamedExpressionType* getNamedType(ASTBuilder* astBuilder, DeclRef<TypeDefDecl> c
         createDefaultSubstitutionsIfNeeded(astBuilder, nullptr, declRef).as<TypeDefDecl>();
 
     return astBuilder->getOrCreate<NamedExpressionType>(specializedDeclRef);
+}
+
+std::tuple<Type*, ParamPassingMode> splitParameterTypeAndDirection(
+    ASTBuilder* astBuilder,
+    Type* paramTypeWithDirection)
+{
+    SLANG_UNUSED(astBuilder);
+    if (as<OutParamType>(paramTypeWithDirection))
+    {
+        auto outParamType = as<OutParamType>(paramTypeWithDirection);
+        return {outParamType->getValueType(), ParamPassingMode::Out};
+    }
+    else if (as<BorrowInOutParamType>(paramTypeWithDirection))
+    {
+        auto inoutParamType = as<BorrowInOutParamType>(paramTypeWithDirection);
+        return {inoutParamType->getValueType(), ParamPassingMode::BorrowInOut};
+    }
+    else if (as<RefParamType>(paramTypeWithDirection))
+    {
+        auto refParamType = as<RefParamType>(paramTypeWithDirection);
+        return {refParamType->getValueType(), ParamPassingMode::Ref};
+    }
+    else if (as<BorrowInParamType>(paramTypeWithDirection))
+    {
+        auto constRefParamType = as<BorrowInParamType>(paramTypeWithDirection);
+        return {constRefParamType->getValueType(), ParamPassingMode::BorrowIn};
+    }
+    else
+    {
+        return {paramTypeWithDirection, ParamPassingMode::In};
+    }
 }
 
 FuncType* getFuncType(ASTBuilder* astBuilder, DeclRef<CallableDecl> const& declRef)
@@ -1104,6 +1286,18 @@ AggTypeDeclBase* getParentAggTypeDeclBase(Decl* decl)
     return nullptr;
 }
 
+ExtensionDecl* getParentExtensionDecl(Decl* decl)
+{
+    decl = decl->parentDecl;
+    while (decl)
+    {
+        if (auto found = as<ExtensionDecl>(decl))
+            return found;
+        decl = decl->parentDecl;
+    }
+    return nullptr;
+}
+
 FunctionDeclBase* getParentFunc(Decl* decl)
 {
     while (decl)
@@ -1214,6 +1408,45 @@ char const* getTryClauseTypeName(TryClauseType c)
         return "Assert";
     default:
         return "Unknown";
+    }
+}
+
+ModifiedType* getTypeWithModifier(Type* baseType, Val* typeModifier)
+{
+    // If the type is not a modified type already, just create one.
+    // If the type already has modifiers:
+    //   if the modifier already exists on the type, just return the regular type.
+    //   otherwise, pull them into a list, add the new modifier, and create a new modified type.
+    //
+    auto astBuilder = getCurrentASTBuilder();
+
+    if (auto modifiedType = as<ModifiedType>(baseType))
+    {
+        // Check if the modifier already exists
+        for (Index i = 0; i < modifiedType->getModifierCount(); i++)
+        {
+            if (modifiedType->getModifier(i) == typeModifier)
+            {
+                // Modifier already exists, return the type as is
+                return modifiedType;
+            }
+        }
+
+        // Collect all existing modifiers and add the new one
+        List<Val*> modifiers;
+        for (Index i = 0; i < modifiedType->getModifierCount(); i++)
+        {
+            modifiers.add(modifiedType->getModifier(i));
+        }
+        modifiers.add(typeModifier);
+
+        // Create a new modified type with all modifiers
+        return as<ModifiedType>(astBuilder->getModifiedType(modifiedType->getBase(), modifiers));
+    }
+    else
+    {
+        // Type is not a modified type, create one with the single modifier
+        return as<ModifiedType>(astBuilder->getModifiedType(baseType, 1, &typeModifier));
     }
 }
 

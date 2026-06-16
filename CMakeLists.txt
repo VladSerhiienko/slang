@@ -56,6 +56,7 @@ include(SlangTarget)
 include(AutoOption)
 include(GitHubRelease)
 include(FetchedSharedLibrary)
+include(CheckSecureCRT)
 
 #
 # Options
@@ -126,7 +127,16 @@ option(
 option(SLANG_ENABLE_DXIL "Enable generating DXIL with DXC" ON)
 
 option(SLANG_ENABLE_FULL_IR_VALIDATION "Enable full IR validation (SLOW!)")
+option(SLANG_ENABLE_VALIDATION_VM_BYTECODE "Enable VM bytecode validation" ON)
 option(SLANG_ENABLE_IR_BREAK_ALLOC "Enable _debugUID on IR allocation")
+option(
+    SLANG_IGNORE_ABORT_MSG
+    "Ignore the system modal assert dialog while running build tools to help LLM workflow."
+    OFF
+)
+if(SLANG_IGNORE_ABORT_MSG)
+    add_compile_definitions(SLANG_IGNORE_ABORT_MSG=1)
+endif()
 option(
     SLANG_ENABLE_ASAN
     "Enable AddressSanitizer (ASan), and UndefinedBehaviorSanitizer (UBSan) if available as well"
@@ -144,7 +154,6 @@ option(
     ON
 )
 
-option(SLANG_ENABLE_PREBUILT_BINARIES "Enable using prebuilt binaries" ON)
 option(SLANG_ENABLE_GFX "Enable gfx targets" ON)
 option(SLANG_ENABLE_SLANGD "Enable language server target" ON)
 option(SLANG_ENABLE_SLANGC "Enable standalone compiler target" ON)
@@ -166,12 +175,6 @@ option(
     ON
 )
 option(SLANG_ENABLE_REPLAYER "Enable slang-replay tool" ON)
-
-option(
-    SLANG_GITHUB_TOKEN
-    "Use a given token value for accessing Github REST API"
-    ""
-)
 
 advanced_option(SLANG_USE_SYSTEM_MINIZ "Build using system Miniz library" OFF)
 advanced_option(SLANG_USE_SYSTEM_LZ4 "Build using system LZ4 library" OFF)
@@ -210,6 +213,17 @@ advanced_option(
     SLANG_ENABLE_SPIRV_TOOLS_MIMALLOC
     "Enable mimalloc for SPIRV-Tools to improve compilation performance"
     ${SLANG_ENABLE_SPIRV_TOOLS_MIMALLOC_DEFAULT}
+)
+
+# TODO: Remove this option once SPIRV-Tools fixes the MergeReturnPass UAF:
+# https://github.com/KhronosGroup/SPIRV-Tools/issues/6711
+# Slang tracking issue: https://github.com/shader-slang/slang/issues/11146
+# Keep the source-build default ON to preserve existing SPIR-V output. Builds that need the
+# temporary workaround can set this OFF explicitly until the upstream fix lands.
+advanced_option(
+    SLANG_ENABLE_SPIRV_OPT_MERGE_RETURN
+    "Register SPIRV-Tools MergeReturnPass + InlineExhaustivePass in the slang-glslang optimizer pipeline; set OFF to opt into the temporary SPIRV-Tools#6711 workaround"
+    ON
 )
 
 option(
@@ -290,12 +304,25 @@ advanced_option(
     "Build using user defined path for mimalloc"
     OFF
 )
-
 advanced_option(
-    SLANG_EXCLUDE_DAWN
-    "Optionally exclude webgpu_dawn from the build"
+    SLANG_OVERRIDE_CMARK_PATH
+    "Build using user defined path for cmark"
     OFF
 )
+
+set(SLANG_EXCLUDE_DAWN_DEFAULT ON)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    set(SLANG_EXCLUDE_DAWN_DEFAULT OFF)
+endif()
+advanced_option(
+    SLANG_EXCLUDE_DAWN
+    "Optionally exclude Dawn WebGPU support from the build"
+    ${SLANG_EXCLUDE_DAWN_DEFAULT}
+)
+set(SLANG_HAS_WEBGPU_SUPPORT OFF)
+if(NOT SLANG_EXCLUDE_DAWN)
+    set(SLANG_HAS_WEBGPU_SUPPORT ON)
+endif()
 
 advanced_option(
     SLANG_EXCLUDE_TINT
@@ -354,7 +381,7 @@ enum_option(
 if(SLANG_SLANG_LLVM_FLAVOR MATCHES FETCH_BINARY)
     # If the user didn't specify a URL, find the best one now
     if(NOT SLANG_SLANG_LLVM_BINARY_URL)
-        get_best_slang_binary_release_url("${SLANG_GITHUB_TOKEN}" url)
+        get_best_slang_binary_release_url(url)
         if(NOT DEFINED url)
             if(SLANG_SLANG_LLVM_FLAVOR STREQUAL FETCH_BINARY_IF_POSSIBLE)
                 message(
@@ -376,27 +403,31 @@ if(SLANG_SLANG_LLVM_FLAVOR MATCHES FETCH_BINARY)
     )
 endif()
 
-if(NOT SLANG_EXCLUDE_DAWN)
-    set(webgpu_dawn_release_tag "webgpu_dawn-0")
-    if(
-        CMAKE_SYSTEM_NAME MATCHES "Windows"
-        AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64"
-    )
-        set(SLANG_WEBGPU_DAWN_BINARY_URL
-            "https://github.com/shader-slang/dawn/releases/download/${webgpu_dawn_release_tag}/webgpu_dawn-windows-x64.zip"
+if(SLANG_HAS_WEBGPU_SUPPORT)
+    if(NOT DEFINED SLANG_WEBGPU_DAWN_BINARY_URL)
+        set(webgpu_dawn_release_tag "webgpu_dawn-0")
+        if(
+            CMAKE_SYSTEM_NAME MATCHES "Windows"
+            AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64"
         )
+            set(SLANG_WEBGPU_DAWN_BINARY_URL
+                "https://github.com/shader-slang/dawn/releases/download/${webgpu_dawn_release_tag}/webgpu_dawn-windows-x64.zip"
+            )
+        endif()
     endif()
 endif()
 
 if(NOT SLANG_EXCLUDE_TINT)
-    set(slang_tint_release_tag "slang-tint-0")
-    if(
-        CMAKE_SYSTEM_NAME MATCHES "Windows"
-        AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64"
-    )
-        set(SLANG_SLANG_TINT_BINARY_URL
-            "https://github.com/shader-slang/dawn/releases/download/${slang_tint_release_tag}/slang-tint-windows-x64.zip"
+    if(NOT DEFINED SLANG_SLANG_TINT_BINARY_URL)
+        set(slang_tint_release_tag "slang-tint-0")
+        if(
+            CMAKE_SYSTEM_NAME MATCHES "Windows"
+            AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64"
         )
+            set(SLANG_SLANG_TINT_BINARY_URL
+                "https://github.com/shader-slang/dawn/releases/download/${slang_tint_release_tag}/slang-tint-windows-x64.zip"
+            )
+        endif()
     endif()
 endif()
 
@@ -531,6 +562,10 @@ if(${SLANG_USE_SYSTEM_GLSLANG})
     endif()
 endif()
 
+if(SLANG_ENABLE_DXIL)
+    include(FetchDXC)
+endif()
+
 add_subdirectory(external)
 
 # webgpu_dawn is only available as a fetched shared library, since Dawn's nested source
@@ -541,7 +576,6 @@ if(SLANG_WEBGPU_DAWN_BINARY_URL)
         "webgpu_dawn"
         "${SLANG_WEBGPU_DAWN_BINARY_URL}"
         IGNORE_FAILURE
-        SLANG_GITHUB_TOKEN ${SLANG_GITHUB_TOKEN}
     )
 endif()
 
@@ -554,7 +588,6 @@ if(SLANG_SLANG_TINT_BINARY_URL)
         "slang-tint"
         "${SLANG_SLANG_TINT_BINARY_URL}"
         IGNORE_FAILURE
-        SLANG_GITHUB_TOKEN ${SLANG_GITHUB_TOKEN}
     )
 endif()
 
@@ -575,6 +608,15 @@ add_subdirectory(source/slang-core-module)
 add_subdirectory(source/slang-glsl-module)
 add_subdirectory(source/slang)
 add_subdirectory(source/slangc)
+if(TARGET slangc)
+    # Keep DXC runtime artifacts and headers staged for targeted slangc builds.
+    foreach(_dxc_stage_target copy-dxcompiler copy-dxil stage-dxc-headers)
+        if(TARGET ${_dxc_stage_target})
+            add_dependencies(slangc ${_dxc_stage_target})
+        endif()
+    endforeach()
+endif()
+add_subdirectory(source/slang-dispatcher)
 add_subdirectory(source/standard-modules)
 add_subdirectory(examples)
 
@@ -636,6 +678,21 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
             NAMESPACE ${PROJECT_NAME}::
             DESTINATION ${SLANG_CMAKE_CONFIG_DIR}
         )
+
+        if(UNIX)
+            configure_file(
+                "${PROJECT_SOURCE_DIR}/extras/pkgconfig/slang-compiler.pc.in"
+                "${PROJECT_BINARY_DIR}/slang-compiler.pc"
+                @ONLY
+            )
+
+            # TODO: When build system is changed to respect CMAKE_INSTALL_LIBDIR,
+            # update this destination.
+            install(
+                FILES "${PROJECT_BINARY_DIR}/slang-compiler.pc"
+                DESTINATION "lib/pkgconfig"
+            )
+        endif()
     endif()
 endif()
 

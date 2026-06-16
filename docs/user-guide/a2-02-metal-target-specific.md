@@ -17,6 +17,12 @@ Slang performs several transformations on entry point parameters when targeting 
 - System value semantics are translated to Metal attributes
 - Parameters without semantics are given automatic attribute indices
 
+### Limitation: `isParameterLocationUsed` for varying inputs
+
+Because Metal entry point varying inputs are packed into a single `[[stage_in]]` struct parameter during legalization, `IMetadata::isParameterLocationUsed` cannot distinguish between used and unused individual varying inputs. The metadata is recorded at the struct level, so if any varying input is used, all varying input locations covered by the struct will be reported as used. This differs from SPIR-V, where each varying input becomes a separate global parameter that can be individually tracked.
+
+This limitation does not affect non-varying resource types (e.g. descriptor table slots), which are tracked individually.
+
 ## System-Value semantics
 
 The system-value semantics are translated to the following Metal attributes:
@@ -131,7 +137,7 @@ the translation of matrix operations to maintain correct semantics:
 
 ## Mesh Shader Support
 
-Mesh shaders can be targeted using the following types and syntax. The same as task/mesh shaders generally in Slang.
+Mesh shaders can be targeted using the following types and syntax, which is the same as for task/mesh shaders generally in Slang.
 
 ```slang
 [outputtopology("triangle")]
@@ -263,6 +269,38 @@ tex[coord] = float2(1,2);  // Automatically expanded to float4(1,2,0,0)
 ## Conservative Rasterization
 
 Since Metal doesn't support conservative rasterization, SV_InnerCoverage is always false.
+
+## SubpassInput
+
+Slang supports `SubpassInput` and `SubpassInputMS` on Metal, lowered to Metal's framebuffer fetch. The `[[vk::input_attachment_index(N)]]` attribute maps to Metal's `[[color(N)]]` fragment input, allowing a fragment shader to read the current value in the render target within the same render pass.
+
+```slang
+[[vk::input_attachment_index(0)]] SubpassInput<float4> color;
+[[vk::input_attachment_index(1)]] SubpassInput<float4> prevBloom;
+
+[shader("fragment")]
+float4 main() : SV_Target
+{
+    return color.SubpassLoad() + prevBloom.SubpassLoad();
+}
+```
+
+This generates a Metal fragment function with `[[color(N)]]` parameters. The `SV_Target` return value is wrapped in a Slang-generated output struct:
+
+```cpp
+struct pixelOutput { float4 output [[color(0)]]; };
+
+[[fragment]] pixelOutput main(float4 color [[color(0)]], float4 prevBloom [[color(1)]]);
+```
+
+Note that `[[vk::input_attachment_index(N)]]` always maps to `[[color(N)]]` regardless of what the attachment semantically holds — Metal framebuffer fetch reads from color attachments only, not from `[[depth]]`/`[[stencil]]` attachments.
+
+### Restrictions
+
+- **Fragment stage only.** `SubpassInput` can only be used in fragment entry points.
+- **Direct entry-point parameters only.** `SubpassInput` cannot be placed inside a `ParameterBlock`. It must be a global-scope declaration directly referenced by the entry point.
+- **No cross-function references.** `SubpassInput` must be referenced only from the fragment entry point or from helper functions that are inlined into it. Mark any helper that calls `SubpassLoad` with `[ForceInline]` to guarantee inlining; `[noinline]` helpers will fail with error E56108.
+- **`SubpassInputMS` per-sample limitation.** Metal does not support per-sample reads. When using `SubpassInputMS`, the sample index passed to `SubpassLoad` is ignored and the resolved value is returned. The compiler emits warning E56107 at each call site where a sample index is provided.
 
 ## Address Space Assignment
 

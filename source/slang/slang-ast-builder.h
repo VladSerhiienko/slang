@@ -108,6 +108,7 @@ protected:
     Type* m_nullPtrType = nullptr;
     Type* m_noneType = nullptr;
     Type* m_diffInterfaceType = nullptr;
+    Type* m_forwardDiffFuncInterfaceType = nullptr;
     Type* m_builtinTypes[Index(BaseType::CountOf)];
     Dictionary<String, Type*> m_magicEnumTypes;
 
@@ -220,6 +221,11 @@ public:
     /// no need for additional state.
     ///
     Dictionary<ValKey, Val*, Hash<ValKey>, ValKeyEqual> m_cachedNodes;
+
+    Dictionary<GenericDecl*, List<Val*>> m_cachedGenericDefaultArgs;
+
+    // For [PrimalSubstitute] and [PrimalSubstituteOf] decorators
+    Dictionary<Decl*, ShortList<Decl*, 4>> m_substituteMap;
 
     /// Create AST types
     template<typename T>
@@ -348,6 +354,8 @@ public:
             //   Lookup of a decl defined in an extension is to lookup directly.
             // - Member(Lookup(w, AssociatedType), TypeConstraintDecl) ==> Lookup(w,
             // TypeConstraintDecl)
+            // - Member(Lookup(w, SubscriptDecl), GetterDecl/SetterDecl) ==> Lookup(w,
+            // GetterDecl/SetterDecl)
             //   Type constraint of an associated type is defined directly in w.
 
             auto parentDeclKind = lookupDeclRef->getDecl()->astNodeType;
@@ -361,11 +369,22 @@ public:
                            lookupDeclRef->getWitness(),
                            memberDecl)
                     .template as<T>();
+            case ASTNodeType::SubscriptDecl:
+                if (memberDecl->astNodeType == ASTNodeType::GetterDecl ||
+                    memberDecl->astNodeType == ASTNodeType::SetterDecl)
+                {
+                    return getLookupDeclRef(
+                               lookupDeclRef->getLookupSource(),
+                               lookupDeclRef->getWitness(),
+                               memberDecl)
+                        .template as<T>();
+                }
+                break;
             default:
                 break;
             }
         }
-        else if (auto directDeclRef = as<DirectDeclRef>(parent.declRefBase))
+        else if (auto directDeclRef = as<DirectDeclRef>(parent.declRefBase); directDeclRef)
         {
             return makeDeclRef(memberDecl);
         }
@@ -428,6 +447,12 @@ public:
 
     DeclRef<Decl> getLookupDeclRef(Type* base, SubtypeWitness* subtypeWitness, Decl* declToLookup)
     {
+        // A `LookupDeclRef`'s lookup `base` and its `subtypeWitness` must stay consistent:
+        // `base` should be the type that `subtypeWitness` proves conforms to the interface
+        // declaring `declToLookup` (i.e. `subtypeWitness->getSub()`). Conformance queries
+        // (`SemanticsVisitor::checkAndConstructSubtypeWitness`) now guarantee the witness is
+        // rooted at the queried type, so a caller threading both through here gets a
+        // well-formed lookup. See #11469 for the interface-as-existential-box subtlety.
         auto result = getOrCreate<LookupDeclRef>(declToLookup, base, subtypeWitness);
         return result;
     }
@@ -532,6 +557,11 @@ public:
     Type* getNoneType() { return m_sharedASTBuilder->getNoneType(); }
     Type* getEnumTypeType() { return m_sharedASTBuilder->getEnumTypeType(); }
     Type* getDiffInterfaceType() { return m_sharedASTBuilder->getDiffInterfaceType(); }
+
+    Type* getForwardDiffFuncInterfaceType(Type* baseType, Witness* typeInfoWitness);
+    Type* getBackwardDiffFuncInterfaceType(Type* baseType, Witness* typeInfoWitness);
+    Type* getBwdCallableBaseType(Type* baseType, Witness* typeInfoWitness);
+
     // Construct the type `Ptr<valueType>`, where `Ptr`
     // is looked up as a builtin type.
     PtrType* getPtrType(
@@ -610,8 +640,12 @@ public:
     DeclRef<InterfaceDecl> getDifferentiableInterfaceDecl();
     DeclRef<InterfaceDecl> getDifferentiableRefInterfaceDecl();
 
+    DeclRef<InterfaceDecl> getFunctionBaseInterfaceDecl();
+
     Type* getDifferentiableInterfaceType();
     Type* getDifferentiableRefInterfaceType();
+
+    Type* getFunctionBaseType();
 
     bool isDifferentiableInterfaceAvailable();
 
@@ -653,6 +687,16 @@ public:
 
     Type* getExpandType(Type* pattern, ArrayView<Val*> capturedPacks);
 
+    Type* getPackBranchType(Val* packOperand, Type* emptyType, Type* nonEmptyType);
+
+    Type* getFirstElement(Type* basePack);
+
+    Type* getLastElement(Type* basePack);
+
+    Type* getTrimFirstPack(Type* basePack);
+
+    Type* getTrimLastPack(Type* basePack);
+
     ConcreteTypePack* getTypePack(ArrayView<Type*> types);
 
     ConcreteIntValPack* getIntValPack(ArrayView<IntVal*> vals);
@@ -660,6 +704,31 @@ public:
     IntVal* getEachIntVal(Type* elementType, Val* basePack);
 
     Val* getExpandIntValPack(Val* patternVal, ArrayView<Val*> capturedPacks);
+
+    Val* getFirstElement(Val* basePack);
+
+    Val* getLastElement(Val* basePack);
+
+    Val* getTrimFirstPack(Val* basePack);
+
+    Val* getTrimLastPack(Val* basePack);
+
+    Val* getShapeConcatIntValPack(Val* leftPack, Val* rightPack, IntVal* axis);
+
+    Val* getShapePermuteIntValPack(Val* valuePack, Val* orderPack);
+
+    Val* getShapeSwapIntValPack(Val* valuePack, IntVal* dim0, IntVal* dim1);
+
+    Val* getShapeReduceIntValPack(Val* valuePack, IntVal* axis);
+
+    NonEmptyPackWitness* getNonEmptyPackWitness(Val* pack);
+    DeclaredVariadicPackCountWitness* getDeclaredVariadicPackCountWitness(
+        DeclRef<GenericVariadicPackCountConstraintDecl> declRef);
+    ConcreteVariadicPackCountWitness* getConcreteVariadicPackCountWitness(
+        Val* pack,
+        IntVal* expectedCount);
+    HasDiffTypeInfoWitness* getHasDiffTypeInfoWitness(
+        DeclRef<HasDiffTypeInfoConstraintDecl> declRef);
 
     /// Produce a witness that `T : T` for any type `T`
     TypeEqualityWitness* getTypeEqualityWitness(Type* type);
@@ -683,6 +752,33 @@ public:
         Type* subType,
         Type* superType,
         SubtypeWitness* patternWitness);
+
+    SubtypeWitness* getFirstSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        SubtypeWitness* patternWitness);
+
+    SubtypeWitness* getLastSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        SubtypeWitness* patternWitness);
+
+    SubtypeWitness* getTrimFirstSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        SubtypeWitness* patternWitness);
+
+    SubtypeWitness* getTrimLastSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        SubtypeWitness* patternWitness);
+
+    SubtypeWitness* getPackBranchSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        Val* packOperand,
+        SubtypeWitness* emptyWitness,
+        SubtypeWitness* nonEmptyWitness);
 
     /// Produce a witness that `A <: C` given witnesses that `A <: B` and `B <: C`
     SubtypeWitness* getTransitiveSubtypeWitness(

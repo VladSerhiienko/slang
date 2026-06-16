@@ -109,25 +109,50 @@ Type* SemanticsVisitor::getConstantBufferType(Type* elementType, Type* layoutTyp
     return m_astBuilder->getConstantBufferType(elementType, layoutType, witness);
 }
 
+static String _getExprName(Expr* expr)
+{
+    if (auto overloadedExpr = as<OverloadedExpr>(expr))
+    {
+        if (overloadedExpr->name)
+            return String(overloadedExpr->name->text);
+    }
+    if (auto declRefExpr = as<DeclRefExpr>(expr))
+    {
+        if (declRefExpr->name)
+            return String(declRefExpr->name->text);
+    }
+    return String();
+}
+
 Expr* SemanticsVisitor::ExpectATypeRepr(Expr* expr)
 {
+    auto originalExpr = expr;
+
     if (auto overloadedExpr = as<OverloadedExpr>(expr))
     {
         expr = resolveOverloadedExpr(overloadedExpr, LookupMask::type);
     }
 
-    if (const auto typeType = as<TypeType>(expr->type))
+    if (const auto typeType = as<TypeType>(expr->type); typeType)
     {
         return expr;
     }
-    else if (const auto errorType = as<ErrorType>(expr->type))
+    else if (const auto errorType = as<ErrorType>(expr->type); errorType)
     {
         return expr;
     }
 
-    getSink()->diagnose(Diagnostics::ExpectedAType{
-        .whatWeGot = expr->type.type ? String(expr->type.type->toString()) : String("null"),
-        .expr = expr});
+    auto name = _getExprName(originalExpr);
+    if (name.getLength() == 0)
+        name = _getExprName(expr);
+
+    StringBuilder whatWeGot;
+    whatWeGot << "a '" << (expr->type.type ? expr->type.type->toString() : toSlice("null")) << "'";
+    if (name.getLength())
+        whatWeGot << " for '" << name << "'";
+
+    getSink()->diagnose(
+        Diagnostics::ExpectedAType{.whatWeGot = whatWeGot.produceString(), .expr = expr});
     return CreateErrorExpr(expr);
 }
 
@@ -150,7 +175,8 @@ IntVal* SemanticsVisitor::ExtractGenericArgInteger(
     Expr* exp,
     Type* genericParamType,
     ConstantFoldingKind kind,
-    DiagnosticSink* sink)
+    DiagnosticSink* sink,
+    ConstantFoldingCircularityInfo* circularityInfo)
 {
     IntVal* val = CheckIntegerConstantExpression(
         exp,
@@ -158,7 +184,8 @@ IntVal* SemanticsVisitor::ExtractGenericArgInteger(
                          : IntegerConstantExpressionCoercionType::AnyInteger,
         genericParamType,
         kind,
-        sink);
+        sink,
+        circularityInfo);
     if (val)
         return val;
 
@@ -176,10 +203,13 @@ IntVal* SemanticsVisitor::ExtractGenericArgInteger(Expr* exp, Type* genericParam
         exp,
         genericParamType,
         ConstantFoldingKind::LinkTime,
-        getSink());
+        getSink(),
+        nullptr);
 }
 
-Val* SemanticsVisitor::ExtractGenericArgVal(Expr* exp)
+Val* SemanticsVisitor::ExtractGenericArgVal(
+    Expr* exp,
+    ConstantFoldingCircularityInfo* circularityInfo)
 {
     if (auto overloadedExpr = as<OverloadedExpr>(exp))
     {
@@ -190,7 +220,7 @@ Val* SemanticsVisitor::ExtractGenericArgVal(Expr* exp)
     {
         return typeType->getType();
     }
-    else if (const auto errorType = as<ErrorType>(exp->type))
+    else if (const auto errorType = as<ErrorType>(exp->type); errorType)
     {
         return exp->type.type;
     }
@@ -200,7 +230,12 @@ Val* SemanticsVisitor::ExtractGenericArgVal(Expr* exp)
         {
             CheckExpr(exp);
         }
-        return ExtractGenericArgInteger(exp, nullptr);
+        return ExtractGenericArgInteger(
+            exp,
+            nullptr,
+            ConstantFoldingKind::LinkTime,
+            getSink(),
+            circularityInfo);
     }
 }
 
@@ -274,8 +309,13 @@ bool SemanticsVisitor::CoerceToProperTypeImpl(
                 // diagnostic.
 
                 // Get the AST node type info, so we can output a 'got' name
+                auto exprName = _getExprName(originalExpr);
+                StringBuilder whatWeGotStr;
+                whatWeGotStr << "a '" << originalExpr->getClass().getName() << "'";
+                if (exprName.getLength())
+                    whatWeGotStr << " for '" << exprName << "'";
                 diagSink->diagnose(Diagnostics::ExpectedAType{
-                    .whatWeGot = originalExpr->getClass().getName(),
+                    .whatWeGot = whatWeGotStr.produceString(),
                     .expr = originalExpr});
             }
         }
@@ -348,7 +388,12 @@ bool SemanticsVisitor::CoerceToProperTypeImpl(
                 }
                 // TODO: this is one place where syntax should get cloned!
                 if (outProperType)
-                    args.add(ExtractGenericArgVal(valParam->initExpr));
+                {
+                    ConstantFoldingCircularityInfo newCircularityInfo(
+                        makeDeclRef(valParam),
+                        nullptr);
+                    args.add(ExtractGenericArgVal(valParam->initExpr, &newCircularityInfo));
+                }
             }
         }
 
@@ -452,6 +497,14 @@ TypeExp SemanticsVisitor::CoerceToUsableType(TypeExp const& typeExp, Decl* decl)
         }
     }
 
+    // Matrix row/column dimension validation is intentionally *not* done at
+    // type-construction time. Rejecting a matrix here would also reject uses
+    // that may be valid on specific targets (e.g. the CPU target, or
+    // capability-gated code paths). Instead, matrices with out-of-range
+    // dimensions are caught at entry-point varying sites by a rule in
+    // `validateEntryPoint`, and downstream codegen for other contexts is
+    // responsible for its own diagnostics.
+
     // A type pack is not a usable type other than for defining parameters.
     if (!as<ParamDecl>(decl) && isTypePack(type))
     {
@@ -460,6 +513,22 @@ TypeExp SemanticsVisitor::CoerceToUsableType(TypeExp const& typeExp, Decl* decl)
         result.type = m_astBuilder->getErrorType();
         return result;
     }
+
+    // Optional<T> cannot wrap a resource/opaque type (e.g. SamplerState, textures, buffers),
+    // nor a struct that transitively contains such a type.
+    if (auto optType = as<OptionalType>(type))
+    {
+        auto valueType = optType->getValueType();
+        if (typeTransitivelyContainsOpaqueHandle(this, valueType))
+        {
+            getSink()->diagnose(Diagnostics::OptionalCannotWrapResourceType{
+                .type = valueType,
+                .expr = typeExp.exp});
+            result.type = m_astBuilder->getErrorType();
+            return result;
+        }
+    }
+
     return result;
 }
 
@@ -487,7 +556,7 @@ bool SemanticsVisitor::ValuesAreEqual(IntVal* left, IntVal* right)
         {
             return leftVar->getDeclRef().equals(rightVar->getDeclRef());
         }
-        else if (const auto rightPoly = as<PolynomialIntVal>(right))
+        else if (const auto rightPoly = as<PolynomialIntVal>(right); rightPoly)
         {
             return right->equals(leftVar);
         }

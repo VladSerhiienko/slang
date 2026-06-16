@@ -8,7 +8,7 @@ public struct BindlessAddress<T> : IPointerLikeAddress<T>
     where T : __BuiltinFloatingPointType
     where T.Differential == T
 {
-    public typealias Differential = BindlessAddress<T.Differential>;
+    public typealias Differential = BindlessAddress<T>;
 
     internal RWStructuredBuffer<T>.Handle handle;
     internal uint baseIndex;
@@ -43,7 +43,6 @@ public struct BindlessAddress<T> : IPointerLikeAddress<T>
     }
 
     [ForceInline]
-    [require(cuda_glsl_hlsl_metal_spirv, sm_6_6)]
     public void atomicAdd(uint index, T value)
     {
         __target_switch
@@ -55,28 +54,24 @@ public struct BindlessAddress<T> : IPointerLikeAddress<T>
         }
     }
 
-    // [ForceInline]
+    [ForceInline]
     public void atomicAdd(uint index, vector<T, 2> value)
     {
         __target_switch
         {
         case cuda:
-            // On CUDA, use packed vector atomic for types that support it (half2, bfloat16x2).
-            // Note: Only use this on CUDA, because Ptr<T[]> is just T** on CUDA.
-
-            // *handle will be resolved to RWStructuredBuffer<T>
             let bufferPtr = __getStructuredBufferPtr(*handle);
-            let doublePtr = reinterpret<T**>(bufferPtr);
+            let doublePtr = bit_cast<T**>(bufferPtr);
             let offsetPtr = doublePtr[0] + baseIndex + index;
-            let vecPtr = reinterpret<vector<T, 2>*>(offsetPtr);
+            let vecPtr = bit_cast<vector<T, 2>*>(offsetPtr);
             __atomic_reduce_add(*vecPtr, value);
         default:
-            // On other targets, fall back to two scalar atomic adds.
             atomicAdd(index, value[0]);
             atomicAdd(index + 1, value[1]);
         }
     }
 
+    [ForwardDerivative(fwd_getOffset)]
     public This getOffset(int elements)
     {
         uint newBaseIndex = baseIndex + elements;
@@ -84,6 +79,27 @@ public struct BindlessAddress<T> : IPointerLikeAddress<T>
         This address = This(handle);
         address.baseIndex = newBaseIndex;
         return address;
+    }
+
+    static DifferentialPtrPair<This> fwd_getOffset(DifferentialPtrPair<This> self, int elements)
+    {
+        return DifferentialPtrPair<This>(
+            self.p.getOffset(elements),
+            self.d.getOffset(elements));
+    }
+
+    typealias BufferType = RWStructuredBuffer<T>;
+
+    [ForceInline]
+    internal RWStructuredBuffer<T> getBuffer()
+    {
+        return *handle;
+    }
+
+    [ForceInline]
+    internal uint getBaseIndex()
+    {
+        return baseIndex;
     }
 
     [ForceInline]
@@ -111,7 +127,7 @@ public struct PointerAddress<T> : IPointerLikeAddress<T>
     where T : __BuiltinFloatingPointType
     where T.Differential == T
 {
-    public typealias Differential = PointerAddress<T.Differential>;
+    public typealias Differential = PointerAddress<T>;
 
     T* ptr;
 
@@ -129,9 +145,31 @@ public struct PointerAddress<T> : IPointerLikeAddress<T>
         set { ptr[index] = newValue; }
     }
 
+    [ForwardDerivative(fwd_getOffset)]
     public This getOffset(int elements)
     {
-        return This(ptr + elements);
+        return no_diff(This(ptr + elements));
+    }
+
+    static DifferentialPtrPair<This> fwd_getOffset(DifferentialPtrPair<This> self, int elements)
+    {
+        return DifferentialPtrPair<This>(
+            self.p.getOffset(elements),
+            self.d.getOffset(elements));
+    }
+
+    typealias BufferType = T*;
+
+    [ForceInline]
+    internal T* getBuffer()
+    {
+        return ptr;
+    }
+
+    [ForceInline]
+    internal uint getBaseIndex()
+    {
+        return 0;
     }
 
     [ForceInline]
@@ -149,7 +187,6 @@ public struct PointerAddress<T> : IPointerLikeAddress<T>
     }
 
     [ForceInline]
-    [require(cuda_glsl_hlsl_metal_spirv, sm_6_6)]
     public void atomicAdd(uint index, T value)
     {
         __target_switch
@@ -211,7 +248,7 @@ public struct TorchTensorViewAddress<T> : IPointerLikeAddress<T>
     where T : __BuiltinFloatingPointType
     where T.Differential == T
 {
-    public typealias Differential = TorchTensorViewAddress<T.Differential>;
+    public typealias Differential = TorchTensorViewAddress<T>;
 
     internal PointerAddress<T> inner;
 
@@ -229,6 +266,7 @@ public struct TorchTensorViewAddress<T> : IPointerLikeAddress<T>
     }
 
     [require(cuda)]
+    [ForwardDerivative(fwd_getOffset)]
     public This getOffset(int elements)
     {
         This result;
@@ -236,8 +274,28 @@ public struct TorchTensorViewAddress<T> : IPointerLikeAddress<T>
         return result;
     }
 
+    static DifferentialPtrPair<This> fwd_getOffset(DifferentialPtrPair<This> self, int elements)
+    {
+        return DifferentialPtrPair<This>(
+            self.p.getOffset(elements),
+            self.d.getOffset(elements));
+    }
+
+    typealias BufferType = T*;
+
     [ForceInline]
-    [require(cuda_glsl_hlsl_metal_spirv, sm_6_6)]
+    internal T* getBuffer()
+    {
+        return inner.getBuffer();
+    }
+
+    [ForceInline]
+    internal uint getBaseIndex()
+    {
+        return inner.getBaseIndex();
+    }
+
+    [ForceInline]
     public void atomicAdd(uint index, T value)
     {
         __target_switch
@@ -284,7 +342,7 @@ internal extension<T> Ptr<T, Access.ReadWrite, AddressSpace.Device> : IPointerLi
     where T : __BuiltinFloatingPointType
     where T.Differential == T
 {
-    internal typealias Differential = Ptr<T.Differential, Access.ReadWrite, AddressSpace.Device>;
+    internal typealias Differential = Ptr<T, Access.ReadWrite, AddressSpace.Device>;
 
     internal __init(Ptr<T, Access.ReadWrite, AddressSpace.Device> ptr)
     {
@@ -300,9 +358,31 @@ internal extension<T> Ptr<T, Access.ReadWrite, AddressSpace.Device> : IPointerLi
         set { this[index] = newValue; }
     }
 
+    [ForwardDerivative(fwd_getOffset)]
     internal This getOffset(int elements)
     {
-        return This(this + elements);
+        return no_diff(This(this + elements));
+    }
+
+    static DifferentialPtrPair<This> fwd_getOffset(DifferentialPtrPair<This> self, int elements)
+    {
+        return DifferentialPtrPair<This>(
+            self.p + elements,
+            self.d + elements);
+    }
+
+    typealias BufferType = T*;
+
+    [ForceInline]
+    internal T* getBuffer()
+    {
+        return this + 0u;
+    }
+
+    [ForceInline]
+    internal uint getBaseIndex()
+    {
+        return 0;
     }
 
     [require(hlsl, sm_6_6)]
@@ -319,7 +399,6 @@ internal extension<T> Ptr<T, Access.ReadWrite, AddressSpace.Device> : IPointerLi
     }
 
     [ForceInline]
-    [require(cuda_glsl_hlsl_metal_spirv, sm_6_6)]
     internal void atomicAdd(uint index, T value)
     {
         __target_switch
@@ -363,6 +442,127 @@ internal extension<T> Ptr<T, Access.ReadWrite, AddressSpace.Device> : IPointerLi
     {
         accessUint4<AccessOp.ATOMIC_ADD, SrcType, T, This, IsAligned, ActualBoundary>(
             this, 0, offsetIndex, value);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative-matrix load/store free functions.
+//
+// Workaround: ideally these would be constrained extensions with
+//   where Address.BufferType == RWStructuredBuffer<T>
+//   where Address.BufferType == T*
+// but associated-type equality constraints in where clauses are not yet
+// supported (https://github.com/shader-slang/slang/issues/9622).
+// Once that is fixed, replace with constrained extensions so the compiler
+// resolves CoopMat.Load/Store overloads statically.
+// ---------------------------------------------------------------------------
+
+[ForceInline]
+[require(cooperative_matrix)]
+internal linalg.CoopMat<T, MemoryScope.Subgroup, M, N, R>
+    loadCoopMat<T, Address, let M : int, let N : int, let R : linalg.CoopMatMatrixUse, let Layout : linalg.CoopMatMatrixLayout>(
+        Address addr, uint element, uint stride)
+    where T : __BuiltinFloatingPointType
+    where T.Differential == T
+    where Address : IPointerLikeAddress<T>
+{
+    typealias RetType = linalg.CoopMat<T, MemoryScope.Subgroup, M, N, R>;
+    if (T is half)
+    {
+        if (Address.BufferType is RWStructuredBuffer<half>)
+        {
+            return bit_cast<RetType>(
+                linalg.CoopMat<half, MemoryScope.Subgroup, M, N, R>.Load<Layout>(
+                    bit_cast<RWStructuredBuffer<half>>(addr.getBuffer()),
+                    addr.getBaseIndex() + element, stride));
+        }
+        else if (Address.BufferType is half*)
+        {
+            return bit_cast<RetType>(
+                linalg.CoopMat<half, MemoryScope.Subgroup, M, N, R>.Load<Layout>(
+                    bit_cast<half*>(addr.getBuffer()),
+                    addr.getBaseIndex() + element, stride));
+        }
+        else
+        {
+            static_assert(false, "Unsupported buffer type");
+        }
+    }
+    else if (T is float)
+    {
+        if (Address.BufferType is RWStructuredBuffer<float>)
+        {
+            return bit_cast<RetType>(
+                linalg.CoopMat<float, MemoryScope.Subgroup, M, N, R>.Load<Layout>(
+                    bit_cast<RWStructuredBuffer<float>>(addr.getBuffer()),
+                    addr.getBaseIndex() + element, stride));
+        }
+        else if (Address.BufferType is float*)
+        {
+            return bit_cast<RetType>(
+                linalg.CoopMat<float, MemoryScope.Subgroup, M, N, R>.Load<Layout>(
+                    bit_cast<float*>(addr.getBuffer()),
+                    addr.getBaseIndex() + element, stride));
+        }
+        else
+        {
+            static_assert(false, "Unsupported buffer type");
+        }
+    }
+    static_assert(false, "Unsupported element type");
+    RetType dummy;
+    return dummy;
+}
+
+[ForceInline]
+[require(cooperative_matrix)]
+internal void storeCoopMat<T, Address, let M : int, let N : int, let R : linalg.CoopMatMatrixUse, let Layout : linalg.CoopMatMatrixLayout>(
+    Address addr,
+    linalg.CoopMat<T, MemoryScope.Subgroup, M, N, R> mat,
+    uint element, uint stride)
+    where T : __BuiltinFloatingPointType
+    where T.Differential == T
+    where Address : IPointerLikeAddress<T>
+{
+    if (T is half)
+    {
+        let concreteMat = bit_cast<linalg.CoopMat<half, MemoryScope.Subgroup, M, N, R>>(mat);
+        if (Address.BufferType is RWStructuredBuffer<half>)
+        {
+            concreteMat.Store<Layout>(
+                bit_cast<RWStructuredBuffer<half>>(addr.getBuffer()),
+                addr.getBaseIndex() + element, stride);
+        }
+        else if (Address.BufferType is half*)
+        {
+            concreteMat.Store<Layout>(
+                bit_cast<half*>(addr.getBuffer()),
+                addr.getBaseIndex() + element, stride);
+        }
+        else
+        {
+            static_assert(false, "Unsupported buffer type");
+        }
+    }
+    else if (T is float)
+    {
+        let concreteMat = bit_cast<linalg.CoopMat<float, MemoryScope.Subgroup, M, N, R>>(mat);
+        if (Address.BufferType is RWStructuredBuffer<float>)
+        {
+            concreteMat.Store<Layout>(
+                bit_cast<RWStructuredBuffer<float>>(addr.getBuffer()),
+                addr.getBaseIndex() + element, stride);
+        }
+        else if (Address.BufferType is float*)
+        {
+            concreteMat.Store<Layout>(
+                bit_cast<float*>(addr.getBuffer()),
+                addr.getBaseIndex() + element, stride);
+        }
+        else
+        {
+            static_assert(false, "Unsupported buffer type");
+        }
     }
 }
 

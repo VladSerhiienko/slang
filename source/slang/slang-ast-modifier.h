@@ -180,6 +180,8 @@ FIDDLE()
 class SynthesizedModifier : public Modifier
 {
     FIDDLE(...)
+    FIDDLE() uint32_t op = kIROp_Nop;
+    FIDDLE() List<Val*> operands;
 };
 
 // Marks that the definition of a func decl is synthesized static invoke func for
@@ -200,6 +202,25 @@ class ExplicitlyDeclaredCapabilityModifier : public Modifier
 // Marks a synthesized variable as local temporary variable.
 FIDDLE()
 class LocalTempVarModifier : public Modifier
+{
+    FIDDLE(...)
+};
+
+// Marks a `VarDecl` whose existential type has been opened directly
+// (i.e. `maybeMoveTemp` reused the variable instead of creating a temporary).
+// If the variable is later reassigned, the opened existential type identity
+// would become stale, so the assignment must be diagnosed.
+FIDDLE()
+class ExistentialOpenedOnVarModifier : public Modifier
+{
+    FIDDLE(...)
+};
+
+// Marks a `VarDecl` that has been reassigned after its initial declaration.
+// A variable with this modifier will not be reused directly in `maybeMoveTemp`;
+// instead, a fresh temporary will be created for each existential opening.
+FIDDLE()
+class VarReassignedModifier : public Modifier
 {
     FIDDLE(...)
 };
@@ -1001,8 +1022,20 @@ class CallAttribute : public Attribute
 };
 // `[call]`
 
+// Marks an enum declaration as unscoped. Added by the parser either from the
+// user-written `[UnscopedEnum]` attribute, or implicitly when a non-generic
+// plain `enum` is compiled with `-unscoped-enum`. Generic enums do not carry
+// this attribute even when `-unscoped-enum` is in effect.
 FIDDLE()
 class UnscopedEnumAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
+// Marker for enum class declarations, used to detect conflicting explicit
+// unscoped/scoped enum declarations. This modifier has no further semantics.
+FIDDLE()
+class EnumClassModifier : public Modifier
 {
     FIDDLE(...)
 };
@@ -1352,6 +1385,19 @@ class NonmutatingAttribute : public Attribute
     FIDDLE(...)
 };
 
+// A `[NoDiscard]` attribute, which indicates that the result of a
+// function call should not be discarded. When a call to a function
+// marked with this attribute is made in a context where its result is
+// discarded — an expression statement, or a `for` loop's side-effect
+// expression, including through parentheses and pass-through operands —
+// the compiler emits an error.
+//
+FIDDLE()
+class NoDiscardAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
 // A `[constref]` attribute, which indicates that the `this` parameter of
 // a member function should be passed by const reference.
 //
@@ -1586,28 +1632,62 @@ class SpecializeAttribute : public Attribute
     FIDDLE(...)
 };
 
+
+// Attribute intended only for interface requirements, to indicate an optional conformance
+// to IForwardDifferentiable<Self> and IBackwardDifferentiable<Self>.
+//
+FIDDLE()
+class MaybeDifferentiableAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
 /// An attribute that marks a type, function or variable as differentiable.
 FIDDLE()
 class DifferentiableAttribute : public Attribute
 {
     FIDDLE(...)
-    // TODO(tfoley): Why is there this duplication here?
-    List<KeyValuePair<Type*, SubtypeWitness*>> m_typeToIDifferentiableWitnessMappings;
+    OrderedDictionary<Val*, OrderedDictionary<SlangInt, Val*>> m_associatedValMapping;
 
-    void addType(Type* declRef, SubtypeWitness* witness)
+    bool hasAssociatedVals(Val* targetVal) const
     {
-        getMapTypeToIDifferentiableWitness();
-        if (m_mapToIDifferentiableWitness.addIfNotExists(declRef, witness))
-        {
-            m_typeToIDifferentiableWitnessMappings.add(
-                KeyValuePair<Type*, SubtypeWitness*>(declRef, witness));
-        }
+        return m_associatedValMapping.containsKey(targetVal);
     }
 
-    /// Mapping from types to subtype witnesses for conformance to IDifferentiable.
-    const OrderedDictionary<Type*, SubtypeWitness*>& getMapTypeToIDifferentiableWitness();
+    auto begin(Val* targetVal) const
+    {
+        SLANG_ASSERT(hasAssociatedVals(targetVal));
+        return m_associatedValMapping.tryGetValue(targetVal)->begin();
+    }
+
+    auto end(Val* targetVal) const { return m_associatedValMapping.tryGetValue(targetVal)->end(); }
+
+    void resolveDictionaryKeys()
+    {
+        // Go over m_associatedValMapping & call ->resolve() on all
+        // the dictionary keys (and re-insert them, if they are different)
+        //
+        OrderedDictionary<Val*, OrderedDictionary<SlangInt, Val*>> newMapping;
+        for (auto& pair : m_associatedValMapping)
+        {
+            auto& assocVals = pair.value;
+            auto newKey = pair.key->resolve();
+            newMapping[newKey] = assocVals;
+        }
+        m_associatedValMapping = newMapping;
+    }
+
+    void addAssocVal(Val* targetVal, SlangInt id, Val* assocVal)
+    {
+        if (!hasAssociatedVals(targetVal))
+            m_associatedValMapping[targetVal] = OrderedDictionary<SlangInt, Val*>();
+        m_associatedValMapping.tryGetValue(targetVal)->addIfNotExists(id, assocVal);
+    }
 
     ValSet m_typeRegistrationWorkingSet;
+    UInt m_typeRegistrationRecursionDepth = 0;
+    bool m_typeRegistrationDepthExceeded = false;
+    SourceLoc m_typeRegistrationDiagnosticLoc;
 
 private:
     OrderedDictionary<Type*, SubtypeWitness*> m_mapToIDifferentiableWitness;
@@ -1656,6 +1736,8 @@ FIDDLE()
 class AutoPyBindCudaAttribute : public Attribute
 {
     FIDDLE(...)
+    FIDDLE() DeclRefExpr* fwdDiffFuncDeclRef = nullptr;
+    FIDDLE() DeclRefExpr* bwdDiffFuncDeclRef = nullptr;
 };
 
 FIDDLE()
@@ -1731,6 +1813,14 @@ class AlwaysFoldIntoUseSiteAttribute : public Attribute
 //
 FIDDLE()
 class TreatAsDifferentiableAttribute : public DifferentiableAttribute
+{
+    FIDDLE(...)
+};
+
+/// The `[HasTrivialForwardDerivative]` attribute indicates that a function has a trivial forward
+/// derivative.
+FIDDLE()
+class HasTrivialForwardDerivativeAttribute : public DifferentiableAttribute
 {
     FIDDLE(...)
 };
@@ -1942,6 +2032,17 @@ class DeprecatedAttribute : public Attribute
     FIDDLE() String message;
 };
 
+/// A `[RemovedSince(languageVersion, "message")]` attribute indicates that the
+/// target has been removed starting from the specified language version.
+///
+FIDDLE()
+class RemovedSinceAttribute : public Attribute
+{
+    FIDDLE(...)
+    FIDDLE() int32_t sinceVersion;
+    FIDDLE() String message;
+};
+
 FIDDLE()
 class NonCopyableTypeAttribute : public Attribute
 {
@@ -2118,6 +2219,12 @@ public:
 
 FIDDLE()
 class ExperimentalModuleAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
+FIDDLE()
+class FunctionInterfaceAttribute : public Attribute
 {
     FIDDLE(...)
 };

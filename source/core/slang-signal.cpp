@@ -48,10 +48,8 @@ String _getMessage(SignalType type, char const* message)
     return buf.produceString();
 }
 
-// Special handler for assertions that can optionally return based on environment variable
-void handleAssert(char const* message)
+void handleAssert(char const* message, char const* file, int line, bool isReleaseAssert)
 {
-#if _WIN32 && defined(_MSC_VER)
     StringBuilder envValue;
     if (SLANG_SUCCEEDED(
             PlatformUtil::getEnvironmentVariable(UnownedStringSlice("SLANG_ASSERT"), envValue)))
@@ -63,8 +61,12 @@ void handleAssert(char const* message)
         {
             // Ignore the assert and continue execution.
             // This is to mimic the behavior of Release build with Debug build.
-            return;
+            if (!isReleaseAssert)
+            {
+                return;
+            }
         }
+#if _WIN32 && defined(_MSC_VER)
         else if (envSlice.caseInsensitiveEquals(UnownedStringSlice::fromLiteral("system")))
         {
             assert(!"SLANG_ASSERT triggered");
@@ -81,11 +83,26 @@ void handleAssert(char const* message)
                 assert(!"SLANG_ASSERT triggered (no debugger attached)");
             }
         }
-    }
 #endif
+    }
 
-    // Default behavior: delegate to handleSignal
-    handleSignal(SignalType::AssertFailure, message);
+    // Strip any remaining directory prefix for readability (the build system already
+    // maps the source root away via -fmacro-prefix-map / /d1trimfile).
+    const char* basename = file ? file : "unknown";
+    if (file)
+    {
+        for (const char* p = file; *p; ++p)
+        {
+            if (*p == '/' || *p == '\\')
+                basename = p + 1;
+        }
+    }
+    // Use a stack buffer to avoid heap allocation on the assertion path, which could
+    // mask the original failure if the heap is corrupted.
+    char locMsg[1024];
+    const char* safeMessage = message ? message : "unknown assert";
+    snprintf(locMsg, sizeof(locMsg), "%s(%d): %s", basename, line, safeMessage);
+    handleSignal(SignalType::AssertFailure, locMsg);
 }
 
 // One point of having as a single function is a choke point both for handling (allowing different

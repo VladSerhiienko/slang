@@ -846,6 +846,88 @@ static LegalVal legalizePrintf(IRTypeLegalizationContext* context, ArrayView<Leg
         legalArgs.getArrayView().getBuffer()));
 }
 
+/// Validate abort payload argument types after variadic-pack and pair legalization.
+/// Scalar values and ordinary vectors with basic element types are accepted because
+/// they have printf-style format specifiers. Composite, pointer, resource, and other
+/// non-basic payloads are rejected with E55211 before target-specific lowering.
+static bool validateAbortArgumentTypes(
+    IRTypeLegalizationContext* context,
+    IRInst* abortInst,
+    ArrayView<IRInst*> args)
+{
+    ShortList<IRInst*> payloadArgs;
+    collectFlattenedVariadicOperands(args, 1, payloadArgs);
+
+    for (auto arg : payloadArgs)
+    {
+        auto argType = arg->getDataType();
+        auto elementType = argType;
+        if (auto vectorType = as<IRVectorType>(argType))
+            elementType = vectorType->getElementType();
+        if (as<IRBasicType>(elementType))
+            continue;
+
+        context->m_sink->diagnose(Diagnostics::AbortArgumentTypeNotSupported{
+            .type = argType,
+            .location = abortInst->sourceLoc});
+        return false;
+    }
+    return true;
+}
+
+/// Legalize an `Abort` instruction by rebuilding it from its legalized operands.
+/// Operands that legalized to nothing (`none`) are dropped, `simple` operands are
+/// forwarded unchanged, and `pair` operands contribute only their ordinary
+/// (non-resource) side, since only ordinary data can be carried in an abort message.
+static LegalVal legalizeAbort(
+    IRTypeLegalizationContext* context,
+    IRInst* originalInst,
+    ArrayView<LegalVal> args)
+{
+    ShortList<IRInst*> legalArgs;
+    for (Index i = 0; i < args.getCount(); i++)
+    {
+        auto arg = args[i];
+        switch (arg.flavor)
+        {
+        case LegalVal::Flavor::none:
+            break;
+        case LegalVal::Flavor::simple:
+            legalArgs.add(arg.getSimple());
+            break;
+        case LegalVal::Flavor::pair:
+            {
+                auto ordinaryVal = arg.getPair()->ordinaryVal;
+                if (ordinaryVal.flavor != LegalVal::Flavor::simple)
+                {
+                    context->m_sink->diagnose(Diagnostics::AbortArgumentTypeNotSupported{
+                        .type = originalInst->getOperand(i)->getDataType(),
+                        .location = originalInst->sourceLoc});
+                    return LegalVal::simple(context->builder->getVoidValue());
+                }
+                legalArgs.add(ordinaryVal.getSimple());
+            }
+            break;
+        default:
+            context->m_sink->diagnose(Diagnostics::AbortArgumentTypeNotSupported{
+                .type = originalInst->getOperand(i)->getDataType(),
+                .location = originalInst->sourceLoc});
+            return LegalVal::simple(context->builder->getVoidValue());
+        }
+    }
+    if (!validateAbortArgumentTypes(context, originalInst, legalArgs.getArrayView().arrayView))
+        return LegalVal::simple(context->builder->getVoidValue());
+
+    auto newAbort = context->builder->emitIntrinsicInst(
+        context->builder->getVoidType(),
+        kIROp_Abort,
+        (UInt)legalArgs.getCount(),
+        legalArgs.getArrayView().getBuffer());
+    newAbort->sourceLoc = originalInst->sourceLoc;
+    originalInst->transferDecorationsTo(newAbort);
+    return LegalVal::simple(newAbort);
+}
+
 static LegalVal legalizeDebugVar(
     IRTypeLegalizationContext* context,
     LegalType type,
@@ -918,9 +1000,13 @@ static LegalVal legalizeDebugValue(
         return LegalVal();
     case LegalType::Flavor::pair:
         {
+            // The var should be legalized as a simple value, because we discard the special part
+            // for debug info insts.
+            //
+            SLANG_ASSERT(debugVar.flavor == LegalVal::Flavor::simple);
             auto ordinaryVal = legalizeDebugValue(
                 context,
-                debugVar.getPair()->ordinaryVal,
+                debugVar,
                 debugValue.getPair()->ordinaryVal,
                 originalInst);
             return ordinaryVal;
@@ -1634,7 +1720,11 @@ static LegalVal legalizeMakeStruct(
             {
                 // Ignore none values.
                 if (legalArgs[aa].flavor == LegalVal::Flavor::none)
+                {
+                    if (!legalType.getSimple()->findDecoration<IROptimizableTypeDecoration>())
+                        args.add(builder->getVoidValue());
                     continue;
+                }
 
                 // Note: we assume that all the arguments
                 // must be simple here, because otherwise
@@ -2073,6 +2163,9 @@ static LegalVal legalizeInst(
     case kIROp_Printf:
         result = legalizePrintf(context, args);
         break;
+    case kIROp_Abort:
+        result = legalizeAbort(context, inst, args);
+        break;
     case kIROp_LoadFromUninitializedMemory:
     case kIROp_Poison:
         return legalizeUndefined(context, inst);
@@ -2087,6 +2180,13 @@ static LegalVal legalizeInst(
         SLANG_ASSERT(type.flavor == LegalType::Flavor::none);
         return LegalVal();
     default:
+        if (type.flavor == LegalType::Flavor::none)
+        {
+            // If the result type of the instruction is `none`, then we can
+            // just legalize to `none` without worrying about the details of
+            // the instruction, since there will be no value to produce.
+            return LegalVal();
+        }
         // TODO: produce a user-visible diagnostic here
         SLANG_UNEXPECTED("non-simple operand(s)!");
         break;
@@ -2342,6 +2442,10 @@ static LegalVal legalizeInst(IRTypeLegalizationContext* context, IRInst* inst)
         if (legalArg.flavor != LegalVal::Flavor::simple)
             anyComplex = true;
     }
+    // Always rebuild abort so its variadic payload is validated before
+    // target-specific legalization or emission.
+    if (inst->getOp() == kIROp_Abort)
+        anyComplex = true;
 
     // We must also legalize the type of the instruction, since that
     // is implicitly one of its operands.
@@ -2380,10 +2484,8 @@ static LegalVal legalizeInst(IRTypeLegalizationContext* context, IRInst* inst)
             inst->replaceUsesWith(newInst);
             inst->removeFromParent();
             context->replacedInstructions.add(inst);
-            for (auto child : inst->getDecorationsAndChildren())
-            {
+            while (auto child = inst->getFirstDecorationOrChild())
                 child->insertAtEnd(newInst);
-            }
             return LegalVal::simple(newInst);
         }
         return LegalVal::simple(inst);
@@ -3286,16 +3388,36 @@ static LegalVal declareVars(
             auto unwrappedTypeLayout = typeLayout;
             IRVarLayout* elementVarLayout = nullptr;
 
-            // If the type layout is a ParameterGroupTypeLayout wrapping a non-struct
-            // element, unwrap to the element layout so resource bindings (e.g.
-            // DescriptorTableSlot) propagate to the declared variable.
-            // Struct elements get pair-decomposed, and the element
-            // layout refers to the full struct rather than the ordinary-only part.
+            // If the type layout is a ParameterGroupTypeLayout whose element
+            // is a resource type (not a struct, and not plain data), unwrap to
+            // the element layout so resource bindings propagate to the declared
+            // variable.
+            //
+            // We must NOT unwrap when the element is a plain data type (e.g.
+            // uint inside ConstantBuffer<uint>), because its type layout only
+            // has Uniform size attributes and createVarLayout would never apply
+            // binding/set offsets from the var chain.
+            //
+            // Struct elements are excluded because they get pair-decomposed, and
+            // the element layout refers to the full struct rather than the
+            // ordinary-only part.
             if (auto paramGroupLayout = as<IRParameterGroupTypeLayout>(typeLayout))
             {
                 auto paramGroupElementVarLayout = paramGroupLayout->getElementVarLayout();
                 auto paramGroupElementTypeLayout = paramGroupElementVarLayout->getTypeLayout();
+                bool elementHasNonUniformResourceSize = false;
                 if (!as<IRStructTypeLayout>(paramGroupElementTypeLayout))
+                {
+                    for (auto sizeAttr : paramGroupElementTypeLayout->getSizeAttrs())
+                    {
+                        if (sizeAttr->getResourceKind() != LayoutResourceKind::Uniform)
+                        {
+                            elementHasNonUniformResourceSize = true;
+                            break;
+                        }
+                    }
+                }
+                if (elementHasNonUniformResourceSize)
                 {
                     elementVarLayout = paramGroupElementVarLayout;
                     unwrappedTypeLayout = paramGroupElementTypeLayout;

@@ -2,9 +2,11 @@
 #include "slang-ir-layout.h"
 
 #include "slang-compiler-options.h"
+#include "slang-ir-check-recursion.h"
 #include "slang-ir-insts.h"
 #include "slang-ir-util.h"
 #include "slang-target.h"
+
 
 // This file implements facilities for computing and caching layout
 // information on IR types.
@@ -218,7 +220,8 @@ Result IRTypeLayoutRules::calcSizeAndAlignment(
     case kIROp_AtomicType:
         {
             auto atomicType = cast<IRAtomicType>(type);
-            calcSizeAndAlignment(targetReq, atomicType->getElementType(), outSizeAndAlignment);
+            SLANG_RETURN_ON_FAIL(
+                calcSizeAndAlignment(targetReq, atomicType->getElementType(), outSizeAndAlignment));
             return SLANG_OK;
         }
         break;
@@ -245,9 +248,44 @@ Result IRTypeLayoutRules::calcSizeAndAlignment(
                 this,
                 vecType->getElementType(),
                 &elementTypeLayout));
-            *outSizeAndAlignment = getVectorSizeAndAlignment(
-                elementTypeLayout,
-                getIntegerValueFromInst(vecType->getElementCount()));
+            // The element count must be a literal integer for the size to be
+            // known. Unspecialized generic vectors (e.g. `vector<T, N>` where
+            // N is still a generic parameter when this code runs, as can
+            // happen during link-time-specialization paths used by the d3d12
+            // backend and the `lowerReinterpret` pass) reach this code and
+            // would crash `getIntegerValueFromInst` (which asserts on
+            // non-`IRIntLit` inputs and reads garbage in release builds).
+            // Report the size as unknown so the caller can fall through to
+            // its own handling instead of segfaulting.
+            auto count = vecType->getElementCount();
+            if (!count || count->getOp() != kIROp_IntLit)
+            {
+                *outSizeAndAlignment =
+                    IRSizeAndAlignment(IRSizeAndAlignment::kIndeterminateSize, 1);
+                return SLANG_FAIL;
+            }
+            *outSizeAndAlignment =
+                getVectorSizeAndAlignment(elementTypeLayout, getIntegerValueFromInst(count));
+            return SLANG_OK;
+        }
+        break;
+    case kIROp_MetalPackedVectorType:
+        {
+            // A packed vector has its element's alignment and no padding,
+            // independent of the layout rules in effect (that is its purpose:
+            // MSL `packed_float3` is 12 bytes with 4-byte alignment).
+            auto packedVecType = cast<IRMetalPackedVectorType>(type);
+            IRSizeAndAlignment elementTypeLayout;
+            SLANG_RETURN_ON_FAIL(getSizeAndAlignment(
+                targetReq,
+                this,
+                packedVecType->getElementType(),
+                &elementTypeLayout));
+            auto count = packedVecType->getElementCount();
+            SLANG_RELEASE_ASSERT(count && count->getOp() == kIROp_IntLit);
+            *outSizeAndAlignment = IRSizeAndAlignment(
+                elementTypeLayout.getStride() * getIntegerValueFromInst(count),
+                elementTypeLayout.alignment);
             return SLANG_OK;
         }
         break;
@@ -322,7 +360,22 @@ Result IRTypeLayoutRules::calcSizeAndAlignment(
         {
             auto matType = cast<IRMatrixType>(type);
             IRBuilder builder(type->getModule());
-            if (getIntegerValueFromInst(matType->getLayout()) == SLANG_MATRIX_LAYOUT_COLUMN_MAJOR)
+            auto layout = matType->getLayout();
+            // The layout operand is normally a literal `SLANG_MATRIX_LAYOUT_*`
+            // constant produced by the front-end, so reaching this guard from
+            // ordinary user code is not expected. The check mirrors the
+            // sibling guard on the vector branch above as defense-in-depth:
+            // if a non-literal ever shows up here (e.g. via a future IR
+            // construction path that retains it as a generic), avoid the
+            // release-build null deref that motivated #11289 and return a
+            // clean `SLANG_FAIL` with an indeterminate size.
+            if (!layout || layout->getOp() != kIROp_IntLit)
+            {
+                *outSizeAndAlignment =
+                    IRSizeAndAlignment(IRSizeAndAlignment::kIndeterminateSize, 1);
+                return SLANG_FAIL;
+            }
+            if (getIntegerValueFromInst(layout) == SLANG_MATRIX_LAYOUT_COLUMN_MAJOR)
             {
                 auto colVector =
                     builder.getVectorType(matType->getElementType(), matType->getRowCount());
@@ -366,6 +419,14 @@ Result IRTypeLayoutRules::calcSizeAndAlignment(
             *outSizeAndAlignment = IRSizeAndAlignment(
                 builtinTypeInfo.genericPointerSize,
                 builtinTypeInfo.genericPointerSize);
+            return SLANG_OK;
+        }
+        break;
+    case kIROp_StringType:
+        if (targetReq && builtinTypeInfo.stringSize != 0)
+        {
+            *outSizeAndAlignment =
+                IRSizeAndAlignment(builtinTypeInfo.stringSize, builtinTypeInfo.stringAlignment);
             return SLANG_OK;
         }
         break;
@@ -431,6 +492,12 @@ Result IRTypeLayoutRules::calcSizeAndAlignment(
             auto tagType = enumType->getTagType();
             return calcSizeAndAlignment(targetReq, tagType, outSizeAndAlignment);
         }
+    case kIROp_TupleNameType:
+        {
+            // Acts like VoidType
+            *outSizeAndAlignment = IRSizeAndAlignment(0, 1);
+            return SLANG_OK;
+        }
         break;
     default:
         break;
@@ -485,6 +552,12 @@ Result getSizeAndAlignment(
     {
         *outSizeAndAlignment = IRSizeAndAlignment(decor->getSize(), (int)decor->getAlignment());
         return SLANG_OK;
+    }
+
+    if (isTypeRecursive(type))
+    {
+        *outSizeAndAlignment = IRSizeAndAlignment(0, 0);
+        return SLANG_E_INTERNAL_FAIL;
     }
 
     IRSizeAndAlignment sizeAndAlignment;
@@ -929,6 +1002,60 @@ IRTypeLayoutRules* IRTypeLayoutRules::get(IRTypeLayoutRuleName name)
         return getLLVM();
     default:
         return nullptr;
+    }
+}
+
+std::optional<IRTypeLayoutRuleName> getTypeLayoutRuleNameFromOp(
+    IROp layoutTypeOp,
+    IRTypeLayoutRuleName defaultLayout)
+{
+    switch (layoutTypeOp)
+    {
+    case kIROp_DefaultBufferLayoutType:
+    case kIROp_DefaultPushConstantBufferLayoutType:
+        return defaultLayout;
+    case kIROp_Std140BufferLayoutType:
+        return IRTypeLayoutRuleName::Std140;
+    case kIROp_Std430BufferLayoutType:
+        return IRTypeLayoutRuleName::Std430;
+    case kIROp_ScalarBufferLayoutType:
+        return IRTypeLayoutRuleName::Natural;
+    case kIROp_CBufferLayoutType:
+        return IRTypeLayoutRuleName::C;
+    case kIROp_D3DConstantBufferLayoutType:
+        return IRTypeLayoutRuleName::D3DConstantBuffer;
+    case kIROp_MetalParameterBlockLayoutType:
+        return IRTypeLayoutRuleName::MetalParameterBlock;
+    case kIROp_CUDABufferLayoutType:
+        return IRTypeLayoutRuleName::CUDA;
+    case kIROp_LLVMBufferLayoutType:
+        return IRTypeLayoutRuleName::LLVM;
+    }
+    return {};
+}
+
+IROp getOpFromTypeLayoutRuleName(IRTypeLayoutRuleName ruleName)
+{
+    switch (ruleName)
+    {
+    case IRTypeLayoutRuleName::Std140:
+        return kIROp_Std140BufferLayoutType;
+    case IRTypeLayoutRuleName::Std430:
+        return kIROp_Std430BufferLayoutType;
+    case IRTypeLayoutRuleName::Natural:
+        return kIROp_ScalarBufferLayoutType;
+    case IRTypeLayoutRuleName::C:
+        return kIROp_CBufferLayoutType;
+    case IRTypeLayoutRuleName::D3DConstantBuffer:
+        return kIROp_D3DConstantBufferLayoutType;
+    case IRTypeLayoutRuleName::MetalParameterBlock:
+        return kIROp_MetalParameterBlockLayoutType;
+    case IRTypeLayoutRuleName::CUDA:
+        return kIROp_CUDABufferLayoutType;
+    case IRTypeLayoutRuleName::LLVM:
+        return kIROp_LLVMBufferLayoutType;
+    default:
+        return kIROp_DefaultBufferLayoutType;
     }
 }
 
