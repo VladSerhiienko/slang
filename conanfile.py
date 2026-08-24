@@ -1,5 +1,6 @@
 import os
 from conan import ConanFile
+from conan.errors import ConanInvalidConfiguration
 from conan.tools.cmake import CMake, CMakeToolchain, CMakeDeps, cmake_layout
 from conan.tools.files import copy, collect_libs
 from conan.tools.build import cross_building
@@ -16,7 +17,7 @@ class SlangConan(ConanFile):
     url = "https://github.com/shader-slang/slang"
 
     settings = "os", "compiler", "build_type", "arch"
-    
+
     # Minimal exports - only what's needed to build the compiler
     # Note: examples/CMakeLists.txt is needed because root CMakeLists.txt calls add_subdirectory(examples)
     #       but examples won't be built since SLANG_ENABLE_EXAMPLES=OFF
@@ -53,7 +54,7 @@ class SlangConan(ConanFile):
         "external/WindowsToolchain/*",
         "external/lua/*",               # Required by slang-fiddle tool
     )
-    
+
     # Dependency versions - matched to Slang's bundled external versions or latest compatible
     _miniz_version = "3.0.2"            # Conan latest compatible with bundled
     _lz4_version = "1.9.4"             # external/lz4 has 1.10.0
@@ -223,10 +224,10 @@ class SlangConan(ConanFile):
 
     def build(self):
         cmake = CMake(self)
-        
+
         # Convert shared option to SLANG_LIB_TYPE
         lib_type = "SHARED" if self.options.shared else "STATIC"
-        
+
         variables={
             # Library type
             "SLANG_LIB_TYPE": lib_type,
@@ -292,10 +293,10 @@ class SlangConan(ConanFile):
             # Get the package folder of the tool_requirement
             slang_pkg_root = self.dependencies.build["slang"].package_folder
             self.output.info(f"Using slang package from build requirements: {slang_pkg_root}")
-            
+
             # Construct the full path to /bin
             slang_bin_dir = os.path.join(slang_pkg_root, "bin")
-            
+
             # Conan uses forward slashes for paths even on Windows, but good to be safe for CMake
             slang_bin_dir = slang_bin_dir.replace("\\", "/")
             self.output.info(f"Using slang bin directory as SLANG_GENERATORS_PATH: {slang_bin_dir}")
@@ -308,7 +309,7 @@ class SlangConan(ConanFile):
     def package(self):
         # We ignore cmake.install() because upstream is unreliable (missing libs, docs issues).
         # We manually grab every artifact we need.
-        
+
         # 1. License
         copy(self, "LICENSE", src=self.source_folder, dst=os.path.join(self.package_folder, "licenses"))
 
@@ -323,33 +324,35 @@ class SlangConan(ConanFile):
         copy(self, "*.dwarf", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
         copy(self, "*.exe", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
         copy(self, "*.dll", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
-        
+
         # 4. Libraries (Recursive grab + Flatten)
         # Finds slang-compiler.lib, slang-rt.lib, AND slang-glslang.lib
         copy(self, "*.lib", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
-        copy(self, "*.a",   src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False) 
+        copy(self, "*.a",   src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
         copy(self, "*.so*", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
         copy(self, "*.dylib", src=self.build_folder, dst=os.path.join(self.package_folder, "lib"), keep_path=False)
-        
+
         # 5. Modules (Slang specific)
         copy(self, "*.slang-module", src=self.build_folder, dst=os.path.join(self.package_folder, "bin"), keep_path=False)
 
     def package_info(self):
-        # Automatically find all the libs we just copied (slang-compiler.lib, slang-glslang.lib, etc.)
-        # self.cpp_info.libs = ["slang"]
-        # self.cpp_info.libs = collect_libs(self)
-
         all_libs = collect_libs(self)
         self.output.info(f"All collected libs: {all_libs}")
 
-        # 2. Filter out the specific plugins that are MH_BUNDLE (not linkable)
-        # We keep 'slang' but remove 'slang-glsl-module' and 'slang-glslang'
-        self.cpp_info.libs = [
-            lib for lib in all_libs 
-            if "glsl-module" not in lib and "glslang" not in lib
-        ]
-        self.output.info(f"Filtered libs: {self.cpp_info.libs}")
-        
+        # Export only the public compiler's static link closure, in dependency
+        # order. collect_libs() sorts archive names alphabetically, which puts
+        # compiler-core before slang-compiler and fails with one-pass linkers.
+        # The remaining packaged archives belong to generators, the alternate
+        # bootstrap compiler, slang-rt, or optional pass-through toolchains.
+        compiler_libs = ["slang-compiler", "compiler-core", "core"]
+        missing_libs = [lib for lib in compiler_libs if lib not in all_libs]
+        if missing_libs:
+            raise ConanInvalidConfiguration(
+                f"Slang compiler package is missing required libraries: {missing_libs}"
+            )
+        self.cpp_info.libs = compiler_libs
+        self.output.info(f"Compiler libraries: {self.cpp_info.libs}")
+
         # Define SLANG_STATIC if not shared
         if not self.options.shared:
             self.cpp_info.defines.append("SLANG_STATIC")
@@ -359,7 +362,7 @@ class SlangConan(ConanFile):
         self.cpp_info.includedirs = ["include"]
         self.cpp_info.libdirs = ["lib"]
         self.cpp_info.bindirs = ["bin"]
-        
+
         # Add bin folder to PATH so 'slangc' is available
         if self.options.enable_slangc or self.options.enable_slangd or self.options.enable_slangrt:
             self.buildenv_info.prepend_path("PATH", os.path.join(self.package_folder, "bin"))
