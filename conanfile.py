@@ -40,6 +40,8 @@ class SlangConan(ConanFile):
         "external/CMakeLists.txt",
         "external/glslang/*",
         "external/glslang-generated/*",
+        "external/cmark/*",
+        "external/fast_float/*",
         "external/spirv/*",
         "external/spirv-headers/*",
         "external/spirv-tools/*",
