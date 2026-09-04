@@ -351,7 +351,7 @@ class SlangConan(ConanFile):
         # compiler-core before slang-compiler and fails with one-pass linkers.
         # The remaining packaged archives belong to generators, the alternate
         # bootstrap compiler, slang-rt, or optional pass-through toolchains.
-        compiler_libs = ["slang-compiler", "compiler-core", "core"]
+        compiler_libs = ["slang-compiler", "compiler-core", "core", "cmark-gfm"]
         missing_libs = [lib for lib in compiler_libs if lib not in all_libs]
         if missing_libs:
             raise ConanInvalidConfiguration(
