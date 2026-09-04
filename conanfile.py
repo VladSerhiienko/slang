@@ -231,6 +231,11 @@ class SlangConan(ConanFile):
         lib_type = "SHARED" if self.options.shared else "STATIC"
 
         variables={
+            # Conan builds from an exported source tree without the .git
+            # directory, so Slang cannot derive its version from git describe.
+            # Keep generated module paths and the public version API stable.
+            "SLANG_VERSION_NUMERIC": str(self.version).removesuffix("-fork"),
+            "SLANG_VERSION_FULL": str(self.version).removesuffix("-fork"),
             # Library type
             "SLANG_LIB_TYPE": lib_type,
             "SLANG_BUILD_STATIC": not self.options.shared,
