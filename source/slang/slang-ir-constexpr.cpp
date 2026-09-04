@@ -39,7 +39,7 @@ bool isConstExpr(IRType* fullType)
     if (auto rateQualifiedType = as<IRRateQualifiedType>(fullType))
     {
         auto rate = rateQualifiedType->getRate();
-        if (const auto constExprRate = as<IRConstExprRate>(rate))
+        if (const auto constExprRate = as<IRConstExprRate>(rate); constExprRate)
             return true;
     }
 
@@ -86,28 +86,50 @@ bool opCanBeConstExpr(IROp op)
     case kIROp_BoolLit:
     case kIROp_Param:
     case kIROp_Add:
+    case kIROp_ConstexprAdd:
     case kIROp_Sub:
+    case kIROp_ConstexprSub:
     case kIROp_Mul:
+    case kIROp_ConstexprMul:
     case kIROp_Div:
+    case kIROp_ConstexprDiv:
     case kIROp_IRem:
+    case kIROp_ConstexprIRem:
     case kIROp_FRem:
     case kIROp_Neg:
+    case kIROp_ConstexprNeg:
     case kIROp_Geq:
+    case kIROp_ConstexprGeq:
     case kIROp_Leq:
+    case kIROp_ConstexprLeq:
     case kIROp_Greater:
+    case kIROp_ConstexprGreater:
     case kIROp_Less:
+    case kIROp_ConstexprLess:
     case kIROp_Neq:
+    case kIROp_ConstexprNeq:
     case kIROp_Eql:
+    case kIROp_ConstexprEql:
     case kIROp_And:
+    case kIROp_ConstexprAnd:
     case kIROp_Or:
+    case kIROp_ConstexprOr:
     case kIROp_BitAnd:
+    case kIROp_ConstexprBitAnd:
     case kIROp_BitOr:
+    case kIROp_ConstexprBitOr:
     case kIROp_BitXor:
+    case kIROp_ConstexprBitXor:
     case kIROp_BitNot:
+    case kIROp_ConstexprBitNot:
     case kIROp_Not:
+    case kIROp_ConstexprNot:
     case kIROp_Lsh:
+    case kIROp_ConstexprShl:
     case kIROp_Rsh:
+    case kIROp_ConstexprShr:
     case kIROp_Select:
+    case kIROp_ConstexprSelect:
     case kIROp_MakeVectorFromScalar:
     case kIROp_MakeVector:
     case kIROp_MakeMatrix:
@@ -116,9 +138,19 @@ bool opCanBeConstExpr(IROp op)
     case kIROp_MakeCoopVector:
     case kIROp_VectorReshape:
     case kIROp_CastFloatToInt:
+    case kIROp_ConstexprCastFloatToInt:
     case kIROp_CastIntToFloat:
+    case kIROp_ConstexprCastIntToFloat:
     case kIROp_IntCast:
+    case kIROp_ConstexprIntCast:
     case kIROp_FloatCast:
+    case kIROp_ConstexprFloatCast:
+    case kIROp_CastIntToEnum:
+    case kIROp_ConstexprCastIntToEnum:
+    case kIROp_CastEnumToInt:
+    case kIROp_ConstexprCastEnumToInt:
+    case kIROp_EnumCast:
+    case kIROp_ConstexprEnumCast:
     case kIROp_CastIntToPtr:
     case kIROp_CastPtrToInt:
     case kIROp_CastPtrToBool:
@@ -132,6 +164,7 @@ bool opCanBeConstExpr(IROp op)
     case kIROp_MakeExistentialWithRTTI:
     case kIROp_MakeOptionalNone:
     case kIROp_MakeOptionalValue:
+    case kIROp_MakeConditionalValue:
     case kIROp_MakeResultError:
     case kIROp_MakeResultValue:
     case kIROp_MakeString:
@@ -149,10 +182,20 @@ bool opCanBeConstExpr(IROp op)
     case kIROp_GetResultError:
     case kIROp_GetResultValue:
     case kIROp_GetOptionalValue:
+    case kIROp_GetConditionalValue:
     case kIROp_DifferentialPairGetDifferential:
     case kIROp_DifferentialPairGetPrimal:
     case kIROp_LookupWitnessMethod:
     case kIROp_Specialize:
+    case kIROp_ExtractFirstFromPack:
+    case kIROp_ExtractLastFromPack:
+    case kIROp_TrimFirstOfPack:
+    case kIROp_TrimLastOfPack:
+    case kIROp_ShapeConcat:
+    case kIROp_ShapePermute:
+    case kIROp_ShapeSwap:
+    case kIROp_ShapeReduce:
+    case kIROp_PackBranch:
         // TODO: more cases
         return true;
 
@@ -184,6 +227,61 @@ IRLoop* isLoopPhi(IRParam* param)
         }
     }
     return nullptr;
+}
+
+// Returns true when every use of `value` as a *value operand* is as a phi
+// argument of an `IRLoop` or `IRUnconditionalBranch`.  Such "feeder" instructions
+// exist only to deliver a value to a loop phi (the loop's initial value or the
+// loop-back value); when the phi in question cannot actually be `constexpr`,
+// the root cause lives at a downstream *consumer* of the phi and diagnosing at
+// the feeder points the user at loop syntax that isn't the real bug.  See
+// `validateConstExpr` and #11018.
+//
+// If `value` has any non-phi-feeder use, this returns false and we let
+// `validateConstExpr` emit at `value->sourceLoc` as usual.
+bool isOnlyUsedAsLoopPhiFeeder(IRInst* value)
+{
+    if (!value || !value->firstUse)
+        return false;
+    bool anyFeederUse = false;
+    for (auto use = value->firstUse; use; use = use->nextUse)
+    {
+        auto user = use->getUser();
+        // An `IRLoop` is also an `IRUnconditionalBranch`, but its phi args start
+        // at operand index 3 (after target/break/continue blocks).  A plain
+        // `IRUnconditionalBranch` has phi args starting at operand 1.
+        bool isArgUse = false;
+        if (auto loop = as<IRLoop>(user))
+        {
+            auto args = loop->getArgs();
+            auto argCount = loop->getArgCount();
+            for (UInt i = 0; i < argCount; ++i)
+            {
+                if (args[i].get() == value)
+                {
+                    isArgUse = true;
+                    break;
+                }
+            }
+        }
+        else if (auto branch = as<IRUnconditionalBranch>(user))
+        {
+            auto args = branch->getArgs();
+            auto argCount = branch->getArgCount();
+            for (UInt i = 0; i < argCount; ++i)
+            {
+                if (args[i].get() == value)
+                {
+                    isArgUse = true;
+                    break;
+                }
+            }
+        }
+        if (!isArgUse)
+            return false;
+        anyFeederUse = true;
+    }
+    return anyFeederUse;
 }
 
 bool opCanBeConstExprByBackwardPass(IRInst* value)
@@ -514,8 +612,18 @@ void validateConstExpr(PropagateConstExprContext* context, IRGlobalValueWithCode
         {
             if (isConstExpr(ii))
             {
-                // For an instruction that must be `constexpr`, we need
-                // to ensure that its argumenst are all `constexpr`
+                // For an instruction that must be `constexpr`, we need to ensure that its
+                // operands are all `constexpr`.  When backward propagation marks a whole
+                // chain of instructions as requiring `constexpr` because a single demand
+                // site (e.g. a call with a `constexpr` parameter) is rooted in a runtime
+                // value, the chain can contain "feeder" instructions whose only purpose is
+                // to deliver a value to a loop phi (the loop-init and loop-back insts).
+                // Diagnosing at such feeder `ii`s points the user at loop syntax
+                // (`-width`, `++y`) that isn't the true constexpr violation -- the true
+                // violation is at a downstream consumer of the phi, and we'll diagnose
+                // there separately.  Suppress feeder diagnostics to avoid the misleading
+                // cascade described in #11018.
+                const bool iiIsLoopPhiFeeder = isOnlyUsedAsLoopPhiFeeder(ii);
 
                 UInt argCount = ii->getOperandCount();
                 for (UInt aa = 0; aa < argCount; ++aa)
@@ -528,10 +636,9 @@ void validateConstExpr(PropagateConstExprContext* context, IRGlobalValueWithCode
                         {
                             if (IRLoop* loopInst = isLoopPhi(param))
                             {
-                                // If the param is a phi node in a loop that
-                                // does not depend on non-constexpr values, we
-                                // can make it constexpr by force unrolling the
-                                // loop, if the loop is unrollable.
+                                // If the param is a phi node in a loop that does not
+                                // depend on non-constexpr values, we can make it constexpr
+                                // by force unrolling the loop, if the loop is unrollable.
                                 if (isUnrollableLoop(loopInst))
                                 {
                                     if (!loopInst->findDecoration<IRForceUnrollDecoration>())
@@ -548,6 +655,15 @@ void validateConstExpr(PropagateConstExprContext* context, IRGlobalValueWithCode
                     }
                     if (shouldDiagnose)
                     {
+                        if (iiIsLoopPhiFeeder)
+                        {
+                            // See the comment above: this instruction exists only to feed
+                            // a loop phi, so diagnosing at its source location would point
+                            // the user at loop syntax rather than at the real constexpr
+                            // demand.  A downstream consumer will surface the same
+                            // violation with a more accurate source location.
+                            break;
+                        }
 
                         // Diagnose the failure.
 

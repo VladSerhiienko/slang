@@ -1,0 +1,74 @@
+# Expected sanitizer findings for Slang.
+#
+# Known sanitizer findings that should not block PRs or nightly runs.
+# Each non-comment, non-empty line is matched against sanitizer log output.
+#
+# Two matching modes:
+#
+#   SUMMARY match (default):
+#     A plain line is a fixed substring matched against SUMMARY lines.
+#     Use the error type + function name for stable matching.
+#       Good:  null-pointer-use in slang::IRBlock::SuccessorList::reverse
+#       Bad:   slang-ir.h:456    (fragile, breaks on any edit)
+#       Bad:   null-pointer-use  (too broad, suppresses all null-pointer findings)
+#
+#   LEAK match (LEAK: prefix):
+#     Lines starting with "LEAK:" match a function name against Direct
+#     leak blocks (root allocations) in the log. A leak SUMMARY is
+#     expected if any Direct leak block matches at least one pattern.
+#     Indirect leaks (child allocations) are skipped since they share
+#     the same root cause. This avoids relying on exact byte/allocation
+#     counts in SUMMARY lines.
+#       Good:  LEAK: _maybeBeginMacroInvocation
+#       Bad:   AddressSanitizer: 20064 byte(s) leaked  (fragile counts)
+#
+# Track each entry with a bug/issue number so entries can be removed
+# when the underlying issue is fixed. Stale entries that match nothing
+# will produce CI warnings as a reminder to clean up.
+#
+# See also:
+#   cmake/lsan-suppressions.txt        -- suppresses leak reports at LSan level
+#   cmake/sanitizer-ignorelist.txt     -- suppresses UBSan checks at compile level
+#   This file                          -- accepts real findings as known issues
+
+# #11938: Repro load leaks CacheFileSystem::PathInfo entries that have no
+# unique identity: the post-load hand-off to the CacheFileSystem's owning
+# unique-identity map skips them (see the TODO in slang-repro.cpp), so
+# nobody owns them. Surfaced by the repro-validator unit tests.
+LEAK: getPathInfoFromFile
+
+# #10893: Use-after-free of TypeLayoutReflection in the slang-rhi
+# ShaderObjectLayout cache during render-test CPU compute tests. The cache
+# is keyed by raw TypeLayoutReflection*, and under server-count=1 those
+# addresses are recycled across sessions, so a cached entry's
+# m_elementTypeLayout can dangle. All three SUMMARY lines below cascade
+# from that single wild pointer: the ASan overflow is the read in
+# TypeLayout::FindResourceInfo, and the two UBSan findings are the bad
+# vptr on the way into it. All three must be listed, since a log counts
+# as expected only when every SUMMARY line in it matches a pattern.
+#
+# These entries were removed on 2026-07-08 in 70b2d94417 (#11937) after
+# several quiet nightlies, then the finding resurfaced in run 30971112743
+# on 2026-08-05. It is intermittent because it depends on allocator address
+# reuse, so quiet runs do not mean it is fixed -- remove these only when
+# #10893 itself is fixed, not merely when they go unmatched for a while.
+#
+# UBSan SUMMARY lines carry only file:line -- no function name -- so these
+# two are position-dependent against the file's own guidance, and will go
+# stale whenever the surrounding code shifts (the reflection entry has
+# already moved 1384 -> 1401). Update the line numbers when that happens.
+# The begin() entry is function-name based and is the durable one.
+Slang::List<Slang::TypeLayout::ResourceInfo, Slang::StandardAllocator>::begin()
+slang-reflection-api.cpp:1401
+slang-type-layout.h:772
+
+# Historical entries:
+#   #10828 LEAK: _maybeBeginMacroInvocation -- fixed by this PR: the
+#     wrong-arg-count macro invocation error paths now free the
+#     MacroInvocation.
+#   #11936 LEAK: SlangRecord::tryWrap / SlangRecord::callWithDefaults /
+#     _replayContext -- fixed: createSession now releases the file-system
+#     wrapper reference it creates; the ReplayContext releases proxies the
+#     playback dispatcher orphaned into discarded outputs at teardown; and
+#     the replay-playback unit tests attach their test proxies instead of
+#     double-counting them.

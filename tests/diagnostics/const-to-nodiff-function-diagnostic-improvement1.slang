@@ -3,28 +3,20 @@
 
 // Similar to const-to-nodiff-function-diagnostic-improvement.slang, but with a CoopVec type
 // to reproduce a more realistic scenario.
-extension<T : __BuiltinFloatingPointType, let K : int> CoopVec<T, K> : IDifferentiable
-{
-    typealias Differential = CoopVec<T, K>;
-};
-
-[BackwardDerivativeOf(exp)]
-void exp_BackwardAutoDiff<T : __BuiltinFloatingPointType, let K : int>(inout DifferentialPair<CoopVec<T, K>> p0, CoopVec<T, K>.Differential dResult)
-{
-    p0 = diffPair(p0.p, dResult * exp(p0.p));
-}
+// CoopVec now gets its differentiability and exp derivative from the core metadata, so this
+// diagnostic no longer needs local stand-ins for those declarations.
 
 [Differentiable]
 CoopVec<T, K> eval<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> x)
 {
-    // CHECK-NOT: error[E41020]
+    // CHECK-NOT: error[E41022]
     return exp(x) - CoopVec<T, K>(1.);
 }
 
 [Differentiable]
 CoopVec<T, K> eval1<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> x)
 {
-    // CHECK: error[E41020]: derivative cannot be propagated through non-differentiable call
+    // CHECK: error[E41022]: derivative cannot be propagated through non-differentiable call
     return exp(x) - CoopVec<T, K>(x[0]);
 }
 

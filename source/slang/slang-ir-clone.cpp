@@ -83,12 +83,6 @@ IRInst* cloneInstAndOperands(IRCloneEnv* env, IRBuilder* builder, IRInst* oldIns
     //
     SLANG_ASSERT(!as<IRConstant>(oldInst));
 
-    const auto canBeSpecConst = canOperationBeSpecConst(
-        oldInst->getOp(),
-        oldInst->getDataType(),
-        nullptr,
-        oldInst->getOperands());
-
     // Next we will iterate over the operands of `oldInst`
     // to find their replacements and install them as
     // the operands of `newInst`.
@@ -103,10 +97,14 @@ IRInst* cloneInstAndOperands(IRCloneEnv* env, IRBuilder* builder, IRInst* oldIns
         auto newOperand = findCloneForOperand(env, oldOperand);
 
         newOperands[ii] = newOperand;
-
-        if (canBeSpecConst)
-            newType = maybeAddRateType(builder, newOperand->getFullType(), newType);
     }
+
+    if (shouldHaveSpecConstRate(
+            oldInst->getOp(),
+            newType,
+            operandCount,
+            newOperands.getArrayView().getBuffer()))
+        newType = ensureSpecConstRate(builder, newType);
 
     // Finally we create the inst with the updated operands.
     auto newInst = builder->emitIntrinsicInst(
@@ -252,6 +250,12 @@ static void _cloneInstDecorationsAndChildren(
         if (lookUp(env, oldChild))
             continue;
 
+        // When dedup returns a pre-existing instruction (e.g. a hoistable inst),
+        // cloning NameHintDecorations onto it again would cause unbounded
+        // accumulation across repeated generic-specialization passes.
+        if (as<IRNameHintDecoration>(oldChild) && newInst->findDecoration<IRNameHintDecoration>())
+            continue;
+
         // Now we can perform the first phase of cloning
         // on the child, and register it in our map from
         // old to new values.
@@ -380,6 +384,18 @@ IRInst* cloneInst(IRCloneEnv* env, IRBuilder* builder, IRInst* oldInst)
     // in an infinite loop)
     //
     if (newInst == oldInst)
+        return newInst;
+
+    // `cloneInstAndOperands` may also return a *different*, pre-existing
+    // hoistable inst via global value numbering (e.g. two witness tables with
+    // the same op/type/operands but different entries, since entries aren't
+    // part of the dedup key). That inst is already fully populated, so
+    // grafting `oldInst`'s children onto it here would add a duplicate,
+    // unrelated entry instead of merging anything. Detect this the same way:
+    // a freshly created hoistable inst is empty until populated below, so one
+    // that already has children here must be a pre-existing dedup hit.
+    //
+    if (getIROpInfo(newInst->getOp()).isHoistable() && newInst->getFirstDecorationOrChild())
         return newInst;
 
     cloneInstDecorationsAndChildren(env, builder->getModule(), oldInst, newInst);

@@ -1,6 +1,6 @@
 #include "slang-ir-autodiff-primal-hoist.h"
 
-#include "../core/slang-func-ptr.h"
+#include "core/slang-func-ptr.h"
 #include "slang-ast-support-types.h"
 #include "slang-ir-autodiff-loop-analysis.h"
 #include "slang-ir-autodiff-region.h"
@@ -30,7 +30,7 @@ bool containsOperand(IRInst* inst, IRInst* operand)
     return false;
 }
 
-static bool isDifferentialInst(IRInst* inst)
+static bool _isDifferentialInst(IRInst* inst)
 {
     auto parent = inst->getParent();
     if (parent->findDecoration<IRDifferentialInstDecoration>())
@@ -429,7 +429,7 @@ RefPtr<HoistedPrimalsInfo> AutodiffCheckpointPolicyBase::processFunc(
         for (auto operand = inst->getOperands(); opIndex < inst->getOperandCount();
              operand++, opIndex++)
         {
-            if (!isDifferentialInst(operand->get()) && !as<IRFunc>(operand->get()) &&
+            if (!_isDifferentialInst(operand->get()) && !as<IRFunc>(operand->get()) &&
                 !as<IRBlock>(operand->get()) && !(as<IRModuleInst>(operand->get()->getParent())) &&
                 !isDifferentialBlock(getBlock(operand->get())))
                 workList.add(operand);
@@ -472,15 +472,6 @@ RefPtr<HoistedPrimalsInfo> AutodiffCheckpointPolicyBase::processFunc(
 
             // General case: we'll add all primal operands to the work list.
             addPrimalOperandsToWorkList(child);
-
-            // Also add type annotations to the list, since these have to be made available to the
-            // function context.
-            //
-            if (as<IRDifferentiableTypeAnnotation>(child))
-            {
-                checkpointInfo->recomputeSet.add(child);
-                addPrimalOperandsToWorkList(child);
-            }
 
             // We'll be conservative with the decorations we consider as differential uses
             // of a primal inst, in order to avoid weird behaviour with some decorations
@@ -536,7 +527,7 @@ RefPtr<HoistedPrimalsInfo> AutodiffCheckpointPolicyBase::processFunc(
                 SLANG_ASSERT(!checkpointInfo->storeSet.contains(result.instToRecompute));
                 checkpointInfo->recomputeSet.add(result.instToRecompute);
 
-                if (isDifferentialInst(use.user) && use.irUse)
+                if (_isDifferentialInst(use.user) && use.irUse)
                     usesToReplace.add(use.irUse);
 
                 if (auto param = as<IRParam>(result.instToRecompute))
@@ -544,6 +535,22 @@ RefPtr<HoistedPrimalsInfo> AutodiffCheckpointPolicyBase::processFunc(
                     if (auto inductionInfo = inductionValueInsts.tryGetValue(param))
                     {
                         checkpointInfo->loopInductionInfo.addIfNotExists(param, *inductionInfo);
+
+                        // Reconstructing an affine induction parameter in the reverse loop creates
+                        // a synthetic use of the loop's initial offset. Register that dependency
+                        // now, while checkpoint policy is deciding which primal values to
+                        // recompute or store.
+                        //
+                        // Consider `for (int i = -start; ...; ++i)`. The offset is the `neg(start)`
+                        // instruction in the primal entry block. No reverse instruction uses it
+                        // yet, so without this pseudo-use the policy never makes it available in
+                        // the reverse loop.
+                        auto counterOffset = inductionInfo->counterOffset;
+                        if (counterOffset && !as<IRModuleInst>(counterOffset->getParent()))
+                        {
+                            SLANG_RELEASE_ASSERT(getParentFunc(counterOffset) == func);
+                            workList.add(UseOrPseudoUse(param, counterOffset));
+                        }
                         continue;
                     }
 
@@ -649,7 +656,7 @@ RefPtr<HoistedPrimalsInfo> AutodiffCheckpointPolicyBase::processFunc(
                     {
                         checkpointInfo->recomputeSet.add(storeUser);
                         checkpointInfo->storeSet.remove(storeUser);
-                        if (callVarWorkListSet.add(callUser))
+                        if (callVarWorkListSet.add(callUser)) // TODO: wut?
                             callVarWorkList.add(callUser);
                     }
                 }
@@ -659,7 +666,7 @@ RefPtr<HoistedPrimalsInfo> AutodiffCheckpointPolicyBase::processFunc(
                 //
                 for (auto use = var->firstUse; use; use = use->nextUse)
                 {
-                    if (isDifferentialInst(use->getUser()))
+                    if (_isDifferentialInst(use->getUser()))
                         usesToReplace.add(use);
                 }
             }
@@ -687,7 +694,7 @@ RefPtr<HoistedPrimalsInfo> AutodiffCheckpointPolicyBase::processFunc(
 
                 for (auto use = call->firstUse; use; use = use->nextUse)
                 {
-                    if (isDifferentialInst(use->getUser()))
+                    if (_isDifferentialInst(use->getUser()))
                         usesToReplace.add(use);
                 }
             }
@@ -1351,6 +1358,20 @@ void applyToInst(
                     SLANG_ASSERT(indexInfo);
                     SLANG_ASSERT(indexInfo->getCount() != 0);
                     replacement = indexInfo->getFirst().diffCountParam;
+
+                    // Convert the synthetic reverse-loop count to the original induction type
+                    // before applying the factor and offset. The loop's initial argument
+                    // (`counterOffset`, when present) already has that type, so every following
+                    // affine arithmetic operation is formed in the induction type. Consider
+                    // `for (int16_t i = -3; ...; ++i)`: adding the raw `int` count to the
+                    // `int16_t` offset creates mismatched operands, while converting the count
+                    // first produces `int16_t(count) + int16_t(-3)`.
+                    if (replacement->getDataType() != inst->getDataType())
+                    {
+                        setInsertAfterOrdinaryInst(builder, replacement);
+                        replacement = builder->emitCast(inst->getDataType(), replacement);
+                    }
+
                     if (inductionValueInfo.counterFactor != 1)
                     {
                         setInsertAfterOrdinaryInst(builder, replacement);
@@ -1363,23 +1384,35 @@ void applyToInst(
                     }
                     if (inductionValueInfo.counterOffset)
                     {
+                        auto counterOffset = inductionValueInfo.counterOffset;
+                        if (checkpointInfo->recomputeSet.contains(counterOffset))
+                        {
+                            // Checkpoint policy recomputed the runtime offset in the corresponding
+                            // recompute block. Use that clone instead of retaining a reference to
+                            // its primal definition.
+                            auto mappedCounterOffset =
+                                cloneCtx->cloneEnv.mapOldValToNew.tryGetValue(counterOffset);
+                            SLANG_RELEASE_ASSERT(mappedCounterOffset);
+                            counterOffset = *mappedCounterOffset;
+                        }
+                        else
+                        {
+                            // A stored value deliberately remains in this use until
+                            // ensurePrimalAvailability replaces it with a load. Module constants
+                            // need no remapping.
+                            SLANG_RELEASE_ASSERT(
+                                checkpointInfo->storeSet.contains(counterOffset) ||
+                                as<IRModuleInst>(counterOffset->getParent()));
+                        }
+
                         setInsertAfterOrdinaryInst(builder, replacement);
                         replacement = builder->emitAdd(
                             replacement->getDataType(),
                             replacement,
-                            inductionValueInfo.counterOffset);
+                            counterOffset);
                     }
                 }
                 SLANG_ASSERT(replacement);
-
-                // If the replacement and inst are not the exact same type, use an int-cast
-                // (e.g. uint vs. int)
-                //
-                if (replacement->getDataType() != inst->getDataType())
-                {
-                    setInsertAfterOrdinaryInst(builder, replacement);
-                    replacement = builder->emitCast(inst->getDataType(), replacement);
-                }
 
                 cloneCtx->cloneEnv.mapOldValToNew[inst] = replacement;
                 cloneCtx->registerClonedInst(builder, inst, replacement);
@@ -1415,11 +1448,6 @@ void applyToInst(
     }
 }
 
-static IRBlock* getParamPreludeBlock(IRGlobalValueWithCode* func)
-{
-    return func->getFirstBlock()->getNextBlock();
-}
-
 void applyCheckpointSet(
     CheckpointSetInfo* checkpointInfo,
     IRGlobalValueWithCode* func,
@@ -1433,13 +1461,8 @@ void applyCheckpointSet(
         cloneCtx->pendingUses.add(use);
 
     // Go back over the insts and move/clone them accoridngly.
-    auto paramPreludeBlock = getParamPreludeBlock(func);
     for (auto block : func->getBlocks())
     {
-        // Skip parameter block and the param prelude block.
-        if (block == func->getFirstBlock() || block == paramPreludeBlock)
-            continue;
-
         if (isDifferentialBlock(block))
             continue;
 
@@ -1568,8 +1591,11 @@ IRVar* emitIndexedLocalVar(
     IRBlock* varBlock,
     IRType* baseType,
     const List<IndexTrackingInfo>& defBlockIndices,
-    SourceLoc location)
+    SourceLoc location,
+    bool shouldInitialize = true)
 {
+    SLANG_UNUSED(shouldInitialize);
+
     // Cannot store pointers. Case should have been handled by now.
     SLANG_RELEASE_ASSERT(!asRelevantPtrType(baseType));
 
@@ -1584,7 +1610,6 @@ IRVar* emitIndexedLocalVar(
     IRType* varType = getTypeForLocalStorage(&varBuilder, baseType, defBlockIndices);
 
     auto var = varBuilder.emitVar(varType);
-    varBuilder.emitStore(var, varBuilder.emitDefaultConstruct(varType));
 
     return var;
 }
@@ -1646,19 +1671,36 @@ IRInst* emitIndexedLoadAddressForVar(
     return loadAddr;
 }
 
+static bool isFuncParam(IRInst* inst)
+{
+    return as<IRParam>(inst) && as<IRBlock>(as<IRParam>(inst)->getParent()) &&
+           as<IRBlock>(as<IRParam>(inst)->getParent()) ==
+               inst->getParent()->getParent()->getFirstBlock();
+}
+
 IRVar* storeIndexedValue(
     IRBuilder* builder,
     IRBlock* defaultVarBlock,
     IRInst* instToStore,
     const List<IndexTrackingInfo>& defBlockIndices)
 {
+    // TODO: This is for AD 2.0 (func param storage)
+    // clean this up.. really don't need all this logic.
+    //
+    if (isFuncParam(instToStore))
+        defaultVarBlock = as<IRBlock>(instToStore->getParent());
+
     IRVar* localVar = emitIndexedLocalVar(
         defaultVarBlock,
         instToStore->getDataType(),
         defBlockIndices,
-        instToStore->sourceLoc);
+        instToStore->sourceLoc,
+        !isFuncParam(instToStore));
 
     IRInst* addr = emitIndexedStoreAddressForVar(builder, localVar, defBlockIndices);
+
+    if (isFuncParam(instToStore))
+        builder->setInsertAfter(addr);
 
     builder->emitStore(addr, instToStore);
 
@@ -2191,6 +2233,11 @@ RefPtr<HoistedPrimalsInfo> ensurePrimalAvailability(
                 if (isLoopCounter)
                     builder.addLoopCounterDecoration(localVar);
 
+                if (as<IRParam>(instToStore) && instToStore->getParent() == func->getFirstBlock())
+                {
+                    builder.addDecoration(localVar, kIROp_ParamsContextDecoration, instToStore);
+                }
+
                 for (auto use : outOfScopeUses)
                 {
                     // TODO: Prevent terminator insts from being treated as passthrough..
@@ -2569,14 +2616,7 @@ void DefaultCheckpointPolicy::preparePolicy(IRGlobalValueWithCode* func)
     return;
 }
 
-enum CheckpointPreference
-{
-    None,
-    PreferCheckpoint,
-    PreferRecompute
-};
-
-static CheckpointPreference getCheckpointPreference(IRInst* callee)
+CheckpointPreference getCheckpointPreference(IRInst* callee)
 {
     callee = getResolvedInstForDecorations(callee, true);
     for (auto decor : callee->getDecorations())
@@ -2639,15 +2679,12 @@ static bool shouldStoreInst(IRInst* inst)
     case kIROp_MakeMatrix:
     case kIROp_MakeArrayFromElement:
     case kIROp_MakeDifferentialPair:
-    case kIROp_MakeDifferentialPairUserCode:
     case kIROp_MakeDifferentialPtrPair:
     case kIROp_MakeOptionalNone:
     case kIROp_MakeOptionalValue:
     case kIROp_MakeExistential:
     case kIROp_DifferentialPairGetDifferential:
     case kIROp_DifferentialPairGetPrimal:
-    case kIROp_DifferentialPairGetDifferentialUserCode:
-    case kIROp_DifferentialPairGetPrimalUserCode:
     case kIROp_DifferentialPtrPairGetDifferential:
     case kIROp_DifferentialPtrPairGetPrimal:
     case kIROp_ExtractExistentialValue:
@@ -2712,7 +2749,6 @@ static bool shouldStoreInst(IRInst* inst)
         //    to store it because the param may be modified by the func at exit. Similarly,
         //    this will be handled in canRecompute().
         return false;
-
     case kIROp_Call:
         {
             // If the callee has a preference, we should follow it.
@@ -2728,12 +2764,13 @@ static bool shouldStoreInst(IRInst* inst)
                 return true;
             }
 
+            IRInst* effectiveInst = inst->getOperand(0);
+
             // If not, we'll default to recomputing calls that don't have side effects & don't
             // load from non-local variables. A previous data-flow pass should have already tagged
             // functions with the appropriate decorations.
             //
-            auto callee = getResolvedInstForDecorations(inst->getOperand(0), true);
-            if (callee->findDecoration<IRReadNoneDecoration>())
+            if (isReadNoneCallee(effectiveInst))
                 return false;
 
             break;
@@ -2753,7 +2790,8 @@ static bool shouldStoreInst(IRInst* inst)
 
 static bool shouldStoreVar(IRVar* var)
 {
-    if (const auto typeDecor = var->findDecoration<IRBackwardDerivativePrimalContextDecoration>())
+    if (const auto typeDecor = var->findDecoration<IRBackwardDerivativePrimalContextDecoration>();
+        typeDecor)
     {
         // If we are specializing a callee's intermediate context with types that can't be stored,
         // we can't store the entire context.
@@ -2820,6 +2858,15 @@ bool DefaultCheckpointPolicy::canRecompute(UseOrPseudoUse use)
             {
                 if (loop->getTargetBlock() == parentBlock)
                     return false;
+            }
+        }
+
+        // We can't recompute function parameters. (param is in the first block of a function)
+        if (auto paramParentBlock = as<IRBlock>(param->getParent()))
+        {
+            if (paramParentBlock == paramParentBlock->getParent()->getFirstBlock())
+            {
+                return false;
             }
         }
     }

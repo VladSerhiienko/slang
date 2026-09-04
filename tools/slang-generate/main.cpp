@@ -1,10 +1,10 @@
 // main.cpp
 
-#include "../../source/core/slang-io.h"
-#include "../../source/core/slang-list.h"
-#include "../../source/core/slang-secure-crt.h"
-#include "../../source/core/slang-string-util.h"
-#include "../../source/core/slang-string.h"
+#include "core/slang-io.h"
+#include "core/slang-list.h"
+#include "core/slang-secure-crt.h"
+#include "core/slang-string-util.h"
+#include "core/slang-string.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -513,7 +513,7 @@ void emitRaw(FILE* stream, char const* begin, char const* end)
             }
             else
             {
-                assert(false);
+                SLANG_ASSERT_FAILURE("non-printable character in string literal");
             }
         }
     }
@@ -854,6 +854,11 @@ List<RefPtr<SourceFile>> gSourceFiles;
 
 int main(int argc, const char* const* argv)
 {
+#if SLANG_IGNORE_ABORT_MSG && defined(_MSC_VER)
+    // Suppress the modal abort() dialog in unattended/LLM-driven builds.
+    _set_abort_behavior(0, _WRITE_ABORT_MSG);
+#endif
+
     // Parse command-line arguments.
     List<String> inputPaths;
     String outputDir;

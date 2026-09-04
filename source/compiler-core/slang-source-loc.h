@@ -2,14 +2,16 @@
 #ifndef SLANG_SOURCE_LOC_H_INCLUDED
 #define SLANG_SOURCE_LOC_H_INCLUDED
 
-#include "../core/slang-basic.h"
-#include "../core/slang-castable.h"
-#include "../core/slang-crypto.h"
-#include "../core/slang-memory-arena.h"
-#include "../core/slang-string-slice-pool.h"
+#include "core/slang-basic.h"
+#include "core/slang-castable.h"
+#include "core/slang-crypto.h"
+#include "core/slang-memory-arena.h"
+#include "core/slang-string-slice-pool.h"
 #include "slang-com-ptr.h"
 #include "slang-source-map.h"
 #include "slang.h"
+
+#include <mutex>
 
 namespace Slang
 {
@@ -140,10 +142,11 @@ public:
     {
     }
 
-    SourceLoc(SourceLoc const& loc)
-        : raw(loc.raw)
-    {
-    }
+    // Copying must stay defaulted (not user-provided) so SourceLoc remains
+    // trivially copyable: aggregates that embed a SourceLoc in a union rely on
+    // that to get trivial whole-object copies (see
+    // `GenericArgumentInferenceFailure` in slang-check-impl.h).
+    SourceLoc(SourceLoc const& loc) = default;
 
     SLANG_FORCE_INLINE bool operator==(const ThisType& rhs) const { return raw == rhs.raw; }
     SLANG_FORCE_INLINE bool operator!=(const ThisType& rhs) const { return !(raw == rhs.raw); }
@@ -312,6 +315,14 @@ public:
     /// Set the content as a string
     void setContents(const String& content);
 
+    /// Return the contents of `rawBlob` decoded to UTF-8 with any leading Unicode
+    /// Byte-Order-Marker removed. This is the canonical "raw file bytes -> source text" transform:
+    /// a UTF-8 file with no BOM is returned unchanged (same blob), while a BOM-prefixed or
+    /// non-UTF-8 file is decoded into a fresh blob. Both `setContents` and any other consumer that
+    /// needs BOM-free source text from an on-disk blob should route through here so the decode
+    /// lives in exactly one place.
+    static ComPtr<ISlangBlob> decodeContentBlob(ISlangBlob* rawBlob);
+
     /// Calculate a display path -> can canonicalize if necessary
     String calcVerbosePath() const;
 
@@ -352,7 +363,8 @@ protected:
     ComPtr<ISlangBlob> m_contentBlob; ///< A blob that owns the storage for the file contents. If
                                       ///< nullptr, there is no contents
     UnownedStringSlice m_content;     ///< The actual contents of the file.
-    size_t m_contentSize;             ///< The size of the actual contents
+    size_t m_contentSize; ///< Initially set to the raw blob size; updated by setContents() to
+                          ///< the decoded content size after BOM/encoding processing.
 
     SHA1::Digest m_digest;
 
@@ -360,6 +372,8 @@ protected:
     // we will cache the starting offset of each line break in
     // the input file:
     List<uint32_t> m_lineBreakOffsets;
+    // Parallel diagnostics and backend work can lazily populate these SourceFile caches.
+    std::mutex m_cacheMutex;
 
     // If set then the locations in this file are really from locations from elsewhere,
     // where the SourceMap specifies that mapping

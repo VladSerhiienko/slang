@@ -1,8 +1,8 @@
 #include "slang-workspace-version.h"
 
-#include "../compiler-core/slang-lexer.h"
-#include "../core/slang-file-system.h"
-#include "../core/slang-io.h"
+#include "compiler-core/slang-lexer.h"
+#include "core/slang-file-system.h"
+#include "core/slang-io.h"
 #include "slang-check-impl.h"
 #include "slang-mangle.h"
 #include "slang-serialize-container.h"
@@ -146,6 +146,17 @@ bool Workspace::updateSearchInWorkspace(bool value)
 {
     bool changed = searchInWorkspace != value;
     searchInWorkspace = value;
+    if (changed)
+    {
+        invalidate();
+    }
+    return changed;
+}
+
+bool Workspace::updatePredefinedLanguageVersion(SlangLanguageVersion version)
+{
+    bool changed = predefinedLanguageVersion != version;
+    predefinedLanguageVersion = version;
     if (changed)
     {
         invalidate();
@@ -518,9 +529,26 @@ RefPtr<WorkspaceVersion> Workspace::createWorkspaceVersion()
     }
     desc.preprocessorMacros = macroDescs.getBuffer();
 
+    // Inject the assumed language version (slang.predefinedLanguageVersion) as a session compiler
+    // option so directive-less files parse at that version; when unset (UNKNOWN) inject nothing and
+    // keep the compiler default. langVersionEntry must outlive the createSession call below, so it
+    // is declared in this scope (compilerOptionEntries borrows it by pointer).
+    slang::CompilerOptionEntry langVersionEntry;
+    if (predefinedLanguageVersion != SLANG_LANGUAGE_VERSION_UNKNOWN)
+    {
+        langVersionEntry.name = slang::CompilerOptionName::LanguageVersion;
+        langVersionEntry.value.kind = slang::CompilerOptionValueKind::Int;
+        langVersionEntry.value.intValue0 = predefinedLanguageVersion;
+        desc.compilerOptionEntries = &langVersionEntry;
+        desc.compilerOptionEntryCount = 1;
+    }
+
     ComPtr<slang::ISession> session;
     slangGlobalSession->createSession(desc, session.writeRef());
-    version->linkage = static_cast<Linkage*>(session.get());
+
+    ComPtr<Linkage> linkage;
+    session->queryInterface(Linkage::getTypeGuid(), (void**)linkage.writeRef());
+    version->linkage = linkage.get();
     version->linkage->contentAssistInfo.checkingMode = ContentAssistCheckingMode::General;
     return version;
 }

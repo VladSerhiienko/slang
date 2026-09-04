@@ -1,12 +1,13 @@
 // slang-session.cpp
 #include "slang-session.h"
 
-#include "../core/slang-shared-library.h"
 #include "compiler-core/slang-artifact-util.h"
+#include "core/slang-shared-library.h"
 #include "slang-check-impl.h"
 #include "slang-compiler.h"
 #include "slang-lower-to-ir.h"
 #include "slang-mangle.h"
+#include "slang-markdown.h"
 #include "slang-options.h"
 #include "slang-parser.h"
 #include "slang-preprocessor.h"
@@ -19,7 +20,7 @@
 namespace Slang
 {
 
-// Helper function to find the neural.slang module path
+// Helper function to find the standard module root path.
 static String getStandardModuleDirPath()
 {
     // Get the path of the currently loaded libslang.so/slang.dll by using a known exported symbol
@@ -33,21 +34,30 @@ static String getStandardModuleDirPath()
     if (libslangDir.getLength() == 0)
         return String();
 
-    // TODO: Change this to SLANG_STANDARD_MODULE_DIR_NAME directory if we add more standard modules
     String stdModuleDirPath = Path::combine(libslangDir, SLANG_STANDARD_MODULE_DIR_NAME);
     return stdModuleDirPath;
 }
 
 static String findStandardModulePath(String const& stdModuleDirPath, String const& moduleName)
 {
-    // The neural module is always in the same directory as libslang.so/slang.dll
-    // e.g., bin/slang-standard-module/ on Windows, lib/slang-standard-module/ on Linux/Mac
+    // Standard modules are co-located with libslang.so/slang.dll under
+    // SLANG_STANDARD_MODULE_DIR_NAME.
+    // Hierarchical imports map to subdirectories, e.g. "slang/neural" or "experimental/workgraph".
     String stdModulePath = Path::combine(stdModuleDirPath, moduleName + ".slang-module");
 
     if (File::exists(stdModulePath))
         return stdModulePath;
 
     return String();
+}
+
+static SHA1::Digest computeSourceBlobDigest(ISlangBlob* blob)
+{
+    SLANG_RELEASE_ASSERT(blob);
+
+    DigestBuilder<SHA1> digestBuilder;
+    digestBuilder.append(blob);
+    return digestBuilder.finalize();
 }
 
 Linkage::Linkage(Session* session, ASTBuilder* astBuilder, Linkage* builtinLinkage)
@@ -79,12 +89,28 @@ SharedSemanticsContext* Linkage::getSemanticsForReflection()
     return m_semanticsForReflection.get();
 }
 
-ISlangUnknown* Linkage::getInterface(const Guid& guid)
+SLANG_NO_THROW SlangResult SLANG_MCALL
+Linkage::queryInterface(SlangUUID const& uuid, void** outObject)
 {
-    if (guid == ISlangUnknown::getTypeGuid() || guid == ISession::getTypeGuid())
-        return asExternal(this);
+    if (!outObject)
+        return SLANG_E_INVALID_ARG;
+    *outObject = nullptr;
 
-    return nullptr;
+    if (uuid == Linkage::getTypeGuid())
+    {
+        *outObject = static_cast<Linkage*>(this);
+        addReference();
+        return SLANG_OK;
+    }
+
+    if (uuid == ISlangUnknown::getTypeGuid() || uuid == ISession::getTypeGuid())
+    {
+        *outObject = static_cast<slang::ISession*>(this);
+        addReference();
+        return SLANG_OK;
+    }
+
+    return SLANG_E_NO_INTERFACE;
 }
 
 Linkage::~Linkage()
@@ -95,11 +121,10 @@ Linkage::~Linkage()
         auto globalSession = getSessionImpl();
         std::lock_guard<std::mutex> lock(globalSession->m_typeCheckingCacheMutex);
         if (!globalSession->m_typeCheckingCache ||
-            globalSession->getTypeCheckingCache()->resolvedOperatorOverloadCache.getCount() <
-                getTypeCheckingCache()->resolvedOperatorOverloadCache.getCount())
+            globalSession->getTypeCheckingCache()->conversionCostCache.getCount() <
+                getTypeCheckingCache()->conversionCostCache.getCount())
         {
             globalSession->m_typeCheckingCache = m_typeCheckingCache;
-            getTypeCheckingCache()->version++;
         }
         destroyTypeCheckingCache();
     }
@@ -221,28 +246,44 @@ slang::IModule* Linkage::loadModuleFromBlob(
 
     try
     {
-        auto getDigestStr = [](auto x)
-        {
-            DigestBuilder<SHA1> digestBuilder;
-            digestBuilder.append(x);
-            return digestBuilder.finalize().toString();
-        };
+        SHA1::Digest sourceDigest = computeSourceBlobDigest(source);
 
         String moduleNameStr = moduleName;
         if (!moduleName)
-            moduleNameStr = getDigestStr(source);
+            moduleNameStr = sourceDigest.toString();
 
         auto name = getNamePool()->getName(moduleNameStr);
         RefPtr<LoadedModule> loadedModule;
         if (mapNameToLoadedModules.tryGetValue(name, loadedModule))
         {
-            return loadedModule;
+            if (!loadedModule)
+                return nullptr;
+
+            if (blobType != ModuleBlobType::Source)
+                return loadedModule;
+
+            // Returning the cached module is only safe when the incoming source
+            // is identical to whatever produced the cached module; otherwise the
+            // caller expects a module they have never actually loaded, leading
+            // to silent wrong-module use (and sometimes crashes) downstream.
+            // See #10957.
+            if (loadedModule->getSourceDigest() == sourceDigest)
+            {
+                return loadedModule;
+            }
+
+            sink.diagnose(Diagnostics::ModuleAlreadyLoadedWithDifferentSource{
+                .moduleName = name,
+                .location = SourceLoc(),
+            });
+            sink.getBlobIfNeeded(outDiagnostics);
+            return nullptr;
         }
         String pathStr = path;
         if (pathStr.getLength() == 0)
         {
             // If path is empty, use a digest from source as path.
-            pathStr = getDigestStr(source);
+            pathStr = sourceDigest.toString();
         }
         auto pathInfo = PathInfo::makeFromString(pathStr);
         if (File::exists(pathStr))
@@ -255,6 +296,8 @@ slang::IModule* Linkage::loadModuleFromBlob(
         }
         RefPtr<Module> module =
             loadModuleImpl(name, pathInfo, source, SourceLoc(), &sink, nullptr, blobType);
+        if (module)
+            module->setSourceDigest(sourceDigest);
         sink.getBlobIfNeeded(outDiagnostics);
         return asExternal(module.get());
     }
@@ -350,6 +393,10 @@ SLANG_NO_THROW SlangResult SLANG_MCALL Linkage::createCompositeComponentType(
     slang::IComponentType** outCompositeComponentType,
     ISlangBlob** outDiagnostics)
 {
+    // Composite creation still mutates linkage-owned front-end state, so keep it serialized
+    // with other specialize/link/layout operations.
+    std::lock_guard<std::recursive_mutex> lock(getComponentTypeOperationMutex());
+
     if (outCompositeComponentType == nullptr)
         return SLANG_E_INVALID_ARG;
 
@@ -417,11 +464,24 @@ SLANG_NO_THROW slang::TypeReflection* SLANG_MCALL Linkage::specializeType(
     }
 
     DiagnosticSink sink(getSourceManager(), Lexer::sourceLocationLexer);
-    auto specializedType =
-        specializeType(unspecializedType, typeArgs.getCount(), typeArgs.getBuffer(), &sink);
-    sink.getBlobIfNeeded(outDiagnostics);
+    try
+    {
+        auto specializedType =
+            specializeType(unspecializedType, typeArgs.getCount(), typeArgs.getBuffer(), &sink);
+        sink.getBlobIfNeeded(outDiagnostics);
 
-    return asExternal(specializedType);
+        return asExternal(specializedType);
+    }
+    catch (const AbortCompilationException& e)
+    {
+        outputExceptionDiagnostic(e, sink, outDiagnostics);
+        return nullptr;
+    }
+    catch (...)
+    {
+        outputExceptionDiagnostic(sink, outDiagnostics);
+        return nullptr;
+    }
 }
 
 DeclRef<GenericDecl> getGenericParentDeclRef(
@@ -470,8 +530,15 @@ bool Linkage::isSpecialized(DeclRef<Decl> declRef)
         return true; // no generics => always specialized
 
     auto defaultArgs = getDefaultSubstitutionArgs(getASTBuilder(), &visitor, as<GenericDecl>(decl));
-    auto currentArgs =
-        SubstitutionSet(declRef).findGenericAppDeclRef(as<GenericDecl>(decl))->getArgs();
+
+    // If the declRef carries no generic-application substitution for this
+    // generic at all (e.g. a bare reference to a generic entry point discovered
+    // via `[shader(...)]`), then nothing has been substituted, so it is
+    // unspecialized.
+    auto genericAppDeclRef = SubstitutionSet(declRef).findGenericAppDeclRef(as<GenericDecl>(decl));
+    if (!genericAppDeclRef)
+        return false;
+    auto currentArgs = genericAppDeclRef->getArgs();
 
     if (defaultArgs.getCount() != currentArgs.getCount()) // should really never happen.
         return true;
@@ -720,6 +787,9 @@ SLANG_NO_THROW SlangResult SLANG_MCALL Linkage::getTypeConformanceWitnessSequent
 
     auto name = getMangledNameForConformanceWitness(m_astBuilder, subType, supType);
     auto interfaceName = getMangledTypeName(m_astBuilder, supType);
+    // API lookups share the same sequential-ID maps that IR lowering updates when tagging
+    // witness tables, so keep each lookup/allocation atomic.
+    std::lock_guard<std::mutex> lock(m_sequentialIDMapMutex);
     uint32_t resultIndex = 0;
     if (mapMangledNameToRTTIObjectIndex.tryGetValue(name, resultIndex))
     {
@@ -1393,10 +1463,13 @@ bool Linkage::isBeingImported(Module* module)
 // and then appending `.slang`.
 //
 // For example, `foo_bar` becomes `foo-bar.slang`.
+// If the name already ends with `.slang` or `.slang.md`,
+// it is returned as-is.
 String getFileNameFromModuleName(Name* name, bool translateUnderScore)
 {
     String fileName;
-    if (!getText(name).getUnownedSlice().endsWithCaseInsensitive(".slang"))
+    if (!getText(name).getUnownedSlice().endsWithCaseInsensitive(".slang") &&
+        !hasLiterateFileExtension(getText(name)))
     {
         StringBuilder sb;
         for (auto c : getText(name))
@@ -1530,7 +1603,13 @@ RefPtr<Module> Linkage::findOrImportModule(
     //
     auto defaultSourceFileName = getFileNameFromModuleName(moduleName, false);
     auto alternativeSourceFileName = getFileNameFromModuleName(moduleName, true);
-    String sourceFileNamesToTry[] = {defaultSourceFileName, alternativeSourceFileName};
+    auto defaultMDFileName = defaultSourceFileName + ".md";
+    auto alternativeMDFileName = alternativeSourceFileName + ".md";
+    String sourceFileNamesToTry[] = {
+        defaultSourceFileName,
+        alternativeSourceFileName,
+        defaultMDFileName,
+        alternativeMDFileName};
 
     // We are going to look for the candidate file using the same
     // logic that would be used for a preprocessor `#include`,
@@ -1550,9 +1629,11 @@ RefPtr<Module> Linkage::findOrImportModule(
     {
         for (auto sourceFileName : sourceFileNamesToTry)
         {
-            // The `sourceFileName` will have the `.slang` extension,
-            // so if we are looking for a binary module, we need
-            // to change the extension we will look for.
+            // The `sourceFileName` will have a `.slang` or `.slang.md`
+            // extension, so if we are looking for a binary module, we
+            // need to change the extension we will look for. For
+            // `.slang.md` files, we first strip the `.md` suffix so
+            // that `Path::replaceExt` replaces `.slang` correctly.
             //
             String fileName;
             switch (type)
@@ -1562,7 +1643,9 @@ RefPtr<Module> Linkage::findOrImportModule(
                 break;
 
             case ModuleBlobType::IR:
-                fileName = Path::replaceExt(sourceFileName, "slang-module");
+                fileName = Path::replaceExt(
+                    maybeStripLiterateFileExtension(sourceFileName),
+                    "slang-module");
                 break;
             }
 
@@ -1647,7 +1730,11 @@ RefPtr<Module> Linkage::findOrImportModule(
             // out any other options.
             //
             if (module)
+            {
+                if (type == ModuleBlobType::Source)
+                    module->setSourceDigest(computeSourceBlobDigest(fileContents));
                 return module;
+            }
         }
     }
 
@@ -1752,7 +1839,12 @@ bool Linkage::isBinaryModuleUpToDate(String fromPath, RIFF::ListChunk const* bas
     String moduleSrcPath = "";
 
     auto dependencyChunks = moduleChunk->getFileDependencies();
-    if (auto firstDependencyChunk = dependencyChunks.getFirst())
+    // The first dependency is the module's own source file. We still check it like the rest of
+    // the dependencies, but if that primary source is unavailable we accept the standalone
+    // precompiled module instead of treating it as stale. Missing later dependencies still
+    // indicate a stale source-backed module cache.
+    auto firstDependencyChunk = dependencyChunks.getFirst();
+    if (firstDependencyChunk)
     {
         moduleSrcPath = firstDependencyChunk->getValue();
 
@@ -1768,6 +1860,7 @@ bool Linkage::isBinaryModuleUpToDate(String fromPath, RIFF::ListChunk const* bas
         }
     }
 
+    Index dependencyIndex = 0;
     for (auto dependencyChunk : dependencyChunks)
     {
         auto file = dependencyChunk->getValue();
@@ -1780,8 +1873,21 @@ bool Linkage::isBinaryModuleUpToDate(String fromPath, RIFF::ListChunk const* bas
                 sourceFile = loadSourceFile(moduleSrcPath, file);
         }
         if (!sourceFile)
-            return false;
+        {
+            if (dependencyIndex == 0)
+            {
+                // If the module's own source file is unavailable, we can't prove staleness, so
+                // fall back to accepting the standalone precompiled module. Missing later
+                // dependencies still indicate a stale source-backed module cache.
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
         digestBuilder.append(sourceFile->getDigest());
+        dependencyIndex++;
     }
     return digestBuilder.finalize() == existingDigest;
 }
@@ -1795,37 +1901,60 @@ Linkage::isBinaryModuleUpToDate(const char* modulePath, slang::IBlob* binaryModu
     return isBinaryModuleUpToDate(modulePath, rootChunk);
 }
 
+SLANG_NO_THROW SlangResult SLANG_MCALL
+Linkage::getDeclSourceLocation(slang::DeclReflection* inDecl, slang::SourceLocation* outLocation)
+{
+    if (!inDecl || !outLocation)
+        return SLANG_E_INVALID_ARG;
+
+    Decl* decl = (Decl*)inDecl;
+    SourceManager* sourceManager = getSourceManager();
+    auto sourceView = sourceManager->findSourceViewRecursively(decl->getNameLoc());
+    if (!sourceView)
+        return SLANG_E_NOT_FOUND;
+
+    auto humaneLoc = sourceView->getHumaneLoc(decl->getNameLoc());
+    outLocation->filePath = nullptr;
+    if (humaneLoc.pathInfo.hasFoundPath())
+    {
+        auto pathSlice = m_stringSlicePool.addAndGetSlice(humaneLoc.pathInfo.foundPath);
+        outLocation->filePath = pathSlice.begin();
+    }
+    outLocation->line = humaneLoc.line;
+    outLocation->column = humaneLoc.column;
+    return SLANG_OK;
+}
+
 SourceFile* Linkage::findFile(Name* name, SourceLoc loc, IncludeSystem& outIncludeSystem)
 {
     auto impl = [&](bool translateUnderScore) -> SourceFile*
     {
-        auto fileName = getFileNameFromModuleName(name, translateUnderScore);
+        auto baseFileName = getFileNameFromModuleName(name, translateUnderScore);
 
-        // Next, try to find the file of the given name,
-        // using our ordinary include-handling logic.
+        String fileNamesToTry[] = {baseFileName, baseFileName + ".md"};
 
         auto& searchDirs = getSearchDirectories();
         outIncludeSystem = IncludeSystem(&searchDirs, getFileSystemExt(), getSourceManager());
 
-        // Get the original path info
         PathInfo pathIncludedFromInfo = getSourceManager()->getPathInfo(loc, SourceLocType::Actual);
-        PathInfo filePathInfo;
 
-        ComPtr<ISlangBlob> fileContents;
-
-        // We have to load via the found path - as that is how file was originally loaded
-        if (SLANG_FAILED(
-                outIncludeSystem.findFile(fileName, pathIncludedFromInfo.foundPath, filePathInfo)))
+        for (auto& fileName : fileNamesToTry)
         {
-            return nullptr;
+            PathInfo filePathInfo;
+            if (SLANG_FAILED(outIncludeSystem
+                                 .findFile(fileName, pathIncludedFromInfo.foundPath, filePathInfo)))
+            {
+                continue;
+            }
+            ComPtr<ISlangBlob> fileContents;
+            SourceFile* sourceFile;
+            if (SLANG_FAILED(outIncludeSystem.loadFile(filePathInfo, fileContents, sourceFile)))
+            {
+                continue;
+            }
+            return sourceFile;
         }
-        // Otherwise, try to load it.
-        SourceFile* sourceFile;
-        if (SLANG_FAILED(outIncludeSystem.loadFile(filePathInfo, fileContents, sourceFile)))
-        {
-            return nullptr;
-        }
-        return sourceFile;
+        return nullptr;
     };
     if (auto rs = impl(false))
         return rs;
@@ -1896,33 +2025,39 @@ Linkage::IncludeResult Linkage::findAndIncludeFile(
     auto combinedPreprocessorDefinitions = translationUnit->getCombinedPreprocessorDefinitions();
     SourceLanguage sourceLanguage = translationUnit->sourceLanguage;
     SlangLanguageVersion slangLanguageVersion = module->getModuleDecl()->languageVersion;
-    auto tokens = preprocessSource(
-        sourceFile,
+
+    auto segments = extractSourceSegments(sourceFile, getSourceManager());
+
+    auto preprocessed = preprocessSourceSegments(
+        segments,
+        sourceLanguage,
+        slangLanguageVersion,
         sink,
         &includeSystem,
         combinedPreprocessorDefinitions,
         this,
-        sourceLanguage,
-        slangLanguageVersion,
         &preprocessorHandler);
-
-    if (sourceLanguage == SourceLanguage::Unknown)
-        sourceLanguage = translationUnit->sourceLanguage;
 
     if (slangLanguageVersion != module->getModuleDecl()->languageVersion)
     {
-        sink->diagnose(Diagnostics::LanguageVersionDiffersFromIncludingModule{
-            .location = tokens.begin()->getLoc()});
+        SourceLoc diagLoc = loc;
+        for (auto& seg : preprocessed)
+        {
+            if (seg.tokens.begin() != seg.tokens.end())
+            {
+                diagLoc = seg.tokens.begin()->getLoc();
+                break;
+            }
+        }
+        sink->diagnose(Diagnostics::LanguageVersionDiffersFromIncludingModule{.location = diagLoc});
     }
 
-    auto outerScope = module->getModuleDecl()->ownedScope;
-    parseSourceFile(
+    parsePreprocessedSegments(
+        preprocessed,
         module->getASTBuilder(),
         translationUnit,
-        sourceLanguage,
-        tokens,
         sink,
-        outerScope,
+        module->getModuleDecl()->ownedScope,
         fileDecl);
 
     module->getModuleDecl()->addMember(fileDecl);
@@ -2140,7 +2275,7 @@ SlangResult Linkage::loadSerializedModuleContents(
     }
     module->setPathInfo(moduleFilePathInfo);
     module->setDigest(moduleChunk->getDigest());
-    module->_collectShaderParams();
+    module->_collectShaderParams(sink);
 
     // When loading from a binary module, the semantic checker doesn't run, so
     // imported modules are not registered in the module dependency list. We

@@ -26,6 +26,64 @@ inline Type* getToType(ASTBuilder* astBuilder, DeclRef<TypeCoercionConstraintDec
     return declRef.substitute(astBuilder, declRef.getDecl()->toType);
 }
 
+inline Type* getBaseType(
+    ASTBuilder* astBuilder,
+    DeclRef<HasDiffTypeInfoConstraintDecl> const& declRef)
+{
+    if (!declRef)
+        return nullptr;
+    return declRef.substitute(astBuilder, declRef.getDecl()->type.Ptr());
+}
+
+inline SubstExpr<Expr> getPackCountConstraintPackExpr(
+    ASTBuilder* astBuilder,
+    DeclRef<GenericVariadicPackCountConstraintDecl> const& declRef)
+{
+    if (!declRef)
+        return SubstExpr<Expr>();
+    return declRef.substitute(astBuilder, declRef.getDecl()->packExpr);
+}
+
+inline DeclRef<Decl> getPackCountConstraintPackDeclRef(
+    ASTBuilder* astBuilder,
+    DeclRef<GenericVariadicPackCountConstraintDecl> const& declRef)
+{
+    // The declaration checker stores the checked pack target in `packDeclRef`;
+    // `packExpr` remains only as source syntax for diagnostics and printing.
+    if (!declRef)
+        return DeclRef<Decl>();
+
+    auto packDeclRef = declRef.getDecl()->packDeclRef;
+    if (!packDeclRef)
+        return DeclRef<Decl>();
+
+    return substituteDeclRef(SubstitutionSet(declRef), astBuilder, packDeclRef);
+}
+
+inline IntVal* getPackCountConstraintActualCount(
+    ASTBuilder* astBuilder,
+    DeclRef<GenericVariadicPackCountConstraintDecl> const& declRef)
+{
+    if (!declRef)
+        return nullptr;
+    auto val = declRef.getDecl()->actualCountVal;
+    if (!val)
+        return nullptr;
+    return as<IntVal>(val->substitute(astBuilder, SubstitutionSet(declRef)));
+}
+
+inline IntVal* getPackCountConstraintExpectedCount(
+    ASTBuilder* astBuilder,
+    DeclRef<GenericVariadicPackCountConstraintDecl> const& declRef)
+{
+    if (!declRef)
+        return nullptr;
+    auto val = declRef.getDecl()->expectedCountVal;
+    if (!val)
+        return nullptr;
+    return as<IntVal>(val->substitute(astBuilder, SubstitutionSet(declRef)));
+}
+
 // `Val`
 
 inline bool areValsEqual(Val* left, Val* right)
@@ -52,6 +110,78 @@ inline int getVectorSize(VectorExpressionType* vecType)
     return 0;
 }
 
+/// Represents what the compiler can currently prove about a variadic pack's cardinality.
+/// This is intentionally coarse-grained: we only track whether a pack is known to be empty,
+/// known to be non-empty, or still unknown.
+enum class VariadicPackCardinality
+{
+    Unknown,
+    Empty,
+    NonEmpty,
+};
+
+template<typename F>
+inline VariadicPackCardinality getPackCardinalityFromStructure(Val* packOperand, const F& recurse)
+{
+    if (!packOperand)
+        return VariadicPackCardinality::Unknown;
+
+    if (auto modifiedType = as<ModifiedType>(packOperand))
+        return recurse(modifiedType->getBase());
+
+    if (auto tupleType = as<TupleType>(packOperand))
+        return recurse(tupleType->getTypePack());
+
+    if (auto concreteTypePack = as<ConcreteTypePack>(packOperand))
+        return concreteTypePack->getTypeCount() > 0 ? VariadicPackCardinality::NonEmpty
+                                                    : VariadicPackCardinality::Empty;
+
+    if (auto concreteIntValPack = as<ConcreteIntValPack>(packOperand))
+        return concreteIntValPack->getCount() > 0 ? VariadicPackCardinality::NonEmpty
+                                                  : VariadicPackCardinality::Empty;
+
+    if (auto shapePermuteIntValPack = as<ShapePermuteIntValPack>(packOperand))
+        return recurse(shapePermuteIntValPack->getValuePack());
+
+    if (auto shapeSwapIntValPack = as<ShapeSwapIntValPack>(packOperand))
+        return recurse(shapeSwapIntValPack->getValuePack());
+
+    if (auto shapeReduceIntValPack = as<ShapeReduceIntValPack>(packOperand))
+        return recurse(shapeReduceIntValPack->getValuePack());
+
+    if (auto shapeConcatIntValPack = as<ShapeConcatIntValPack>(packOperand))
+    {
+        auto leftCardinality = recurse(shapeConcatIntValPack->getLeftPack());
+        auto rightCardinality = recurse(shapeConcatIntValPack->getRightPack());
+        if (leftCardinality == VariadicPackCardinality::Empty &&
+            rightCardinality == VariadicPackCardinality::Empty)
+            return VariadicPackCardinality::Empty;
+        if (leftCardinality == VariadicPackCardinality::NonEmpty ||
+            rightCardinality == VariadicPackCardinality::NonEmpty)
+            return VariadicPackCardinality::NonEmpty;
+    }
+
+    return VariadicPackCardinality::Unknown;
+}
+
+bool tryGetConstantIntVal(Val* val, IntegerLiteralValue& outValue);
+
+bool tryFindProvableDuplicateOrderIndices(
+    ConcreteIntValPack* orderPack,
+    Index& outFirstPosition,
+    Index& outSecondPosition,
+    IntegerLiteralValue& outConcreteIndex,
+    bool& outHasConcreteIndex);
+
+bool areProvablyDifferentShapeElements(Val* left, Val* right);
+
+bool hasAnyPotentialConcatAxis(ConcreteIntValPack* leftPack, ConcreteIntValPack* rightPack);
+
+VariadicPackCardinality getKnownPackCardinality(Val* packOperand);
+
+const char* getPackQueryName(PackQueryExpr* expr);
+const char* getShapePackTransformName(ShapePackTransformExpr* expr);
+
 //
 // Declarations
 //
@@ -59,7 +189,7 @@ inline int getVectorSize(VectorExpressionType* vecType)
 struct SemanticsVisitor;
 
 List<ExtensionDecl*> const& getCandidateExtensions(
-    DeclRef<AggTypeDecl> const& declRef,
+    DeclRef<Decl> const& declRef,
     SemanticsVisitor* semantics);
 
 // Returns the members of `genericInnerDecl`'s enclosing generic decl.
@@ -109,6 +239,11 @@ inline FilteredMemberRefList<T> getMembersOfType(
         declRef.getDecl()->getDirectMemberDecls(),
         declRef,
         filterStyle);
+}
+
+inline bool hasDirectFuncType(DeclRef<CallableDecl> declRef)
+{
+    return declRef.getDecl()->funcType.type != nullptr;
 }
 
 void _foreachDirectOrExtensionMemberOfType(
@@ -291,6 +426,9 @@ ParamPassingMode getExplicitlyDeclaredParamPassingMode(ParamDecl* paramDecl);
 ///
 ParamPassingMode getParamPassingMode(ParamDecl* paramDecl);
 
+/// Returns true if `type` or one of its modified-type bases carries `no_diff`.
+bool doesTypeHaveNoDiffModifier(Type* type);
+
 inline Type* getTagType(ASTBuilder* astBuilder, DeclRef<EnumDecl> declRef)
 {
     return declRef.substitute(astBuilder, declRef.getDecl()->tagType);
@@ -308,6 +446,13 @@ inline Type* getType(ASTBuilder* astBuilder, DeclRef<TypeDefDecl> declRef)
 
 inline Type* getResultType(ASTBuilder* astBuilder, DeclRef<CallableDecl> declRef)
 {
+    if (hasDirectFuncType(declRef))
+    {
+        auto substituted = declRef.substitute(astBuilder, declRef.getDecl()->funcType.type);
+        if (auto funcType = as<FuncType>(substituted->resolve()))
+            return funcType->getResultType();
+    }
+
     return declRef.substitute(astBuilder, declRef.getDecl()->returnType.type);
 }
 
@@ -329,6 +474,10 @@ inline FilteredMemberRefList<ParamDecl> getParameters(
 {
     return getMembersOfType<ParamDecl>(astBuilder, declRef);
 }
+
+std::tuple<Type*, ParamPassingMode> splitParameterTypeAndDirection(
+    ASTBuilder* astBuilder,
+    Type* paramTypeWithDirection);
 
 inline Decl* getInner(DeclRef<GenericDecl> declRef)
 {
@@ -390,6 +539,12 @@ ArrayExpressionType* getArrayType(ASTBuilder* astBuilder, Type* elementType);
 
 NamedExpressionType* getNamedType(ASTBuilder* astBuilder, DeclRef<TypeDefDecl> const& declRef);
 
+/// Returns the canonical AST lookup name shared by subscript declarations and expressions.
+inline Name* getSubscriptOperatorName(ASTBuilder* astBuilder)
+{
+    return astBuilder->getNamePool()->getName("operator[]");
+}
+
 FuncType* getFuncType(ASTBuilder* astBuilder, DeclRef<CallableDecl> const& declRef);
 
 GenericDeclRefType* getGenericDeclRefType(
@@ -399,6 +554,8 @@ GenericDeclRefType* getGenericDeclRefType(
 NamespaceType* getNamespaceType(ASTBuilder* astBuilder, DeclRef<NamespaceDeclBase> const& declRef);
 
 SamplerStateType* getSamplerStateType(ASTBuilder* astBuilder);
+
+ModifiedType* getTypeWithModifier(Type* baseType, Val* typeModifier);
 
 
 // Definitions that can't come earlier despite
@@ -450,6 +607,7 @@ Module* getModule(Decl* decl);
 ContainerDecl* getParentDecl(Decl* decl);
 AggTypeDecl* getParentAggTypeDecl(Decl* decl);
 AggTypeDeclBase* getParentAggTypeDeclBase(Decl* decl);
+ExtensionDecl* getParentExtensionDecl(Decl* decl);
 FunctionDeclBase* getParentFunc(Decl* decl);
 
 /// Get the parent declref, skipping any generic decls in between.

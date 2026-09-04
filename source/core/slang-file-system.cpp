@@ -1,7 +1,7 @@
 #include "slang-file-system.h"
 
-#include "../core/slang-io.h"
-#include "../core/slang-string-util.h"
+#include "core/slang-io.h"
+#include "core/slang-string-util.h"
 #include "slang-com-ptr.h"
 
 namespace Slang
@@ -1140,6 +1140,26 @@ SlangResult RelativeFileSystem::createDirectory(const char* path)
     String fixedPath;
     SLANG_RETURN_ON_FAIL(_getFixedPath(path, fixedPath));
     return fileSystem->createDirectory(fixedPath.getBuffer());
+}
+
+/* !!!!!!!!!!!!!!!!!!!!!!!!!!!!! NULLFileSystem !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!*/
+
+ISlangUnknown* NULLFileSystem::getInterface(const Guid& guid)
+{
+    if (guid == ISlangUnknown::getTypeGuid() || guid == ICastable::getTypeGuid() ||
+        guid == ISlangCastable::getTypeGuid() || guid == ISlangFileSystem::getTypeGuid() ||
+        guid == ISlangFileSystemExt::getTypeGuid() ||
+        guid == ISlangMutableFileSystem::getTypeGuid())
+    {
+        return static_cast<ISlangMutableFileSystem*>(this);
+    }
+    return nullptr;
+}
+
+void* NULLFileSystem::getObject(const Guid& guid)
+{
+    SLANG_UNUSED(guid);
+    return nullptr;
 }
 
 } // namespace Slang

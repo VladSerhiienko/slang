@@ -1,7 +1,7 @@
 // slang-doc-ast.cpp
 #include "slang-doc-ast.h"
 
-#include "../core/slang-string-util.h"
+#include "core/slang-string-util.h"
 #include "slang-ast-support-types.h"
 // #include "slang-ast-builder.h"
 // #include "slang-ast-print.h"
@@ -13,15 +13,15 @@ namespace Slang
 {
     typedef Extractor::SearchStyle SearchStyle;
 
-    if (const auto enumCaseDecl = as<EnumCaseDecl>(decl))
+    if (const auto enumCaseDecl = as<EnumCaseDecl>(decl); enumCaseDecl)
     {
         return SearchStyle::EnumCase;
     }
-    if (const auto paramDecl = as<ParamDecl>(decl))
+    if (const auto paramDecl = as<ParamDecl>(decl); paramDecl)
     {
         return SearchStyle::Param;
     }
-    else if (const auto callableDecl = as<CallableDecl>(decl))
+    else if (const auto callableDecl = as<CallableDecl>(decl); callableDecl)
     {
         return SearchStyle::Function;
     }

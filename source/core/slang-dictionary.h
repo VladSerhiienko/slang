@@ -143,7 +143,18 @@ public:
     //
 
     // Removes all values from the map
-    void clear() { map.clear(); }
+    void clear()
+    {
+        if (!map.empty())
+            map.clear();
+    }
+
+    // Removes all values and releases backing storage.
+    void clearAndDeallocate()
+    {
+        InnerMap emptyMap(0, map.hash_function(), map.key_eq(), map.get_allocator());
+        map.swap(emptyMap);
+    }
 
     // Erases the value at the specified key if it exists
     void remove(const TKey& key) { map.erase(key); }
@@ -178,6 +189,7 @@ public:
     //
 
     std::size_t getCount() const { return map.size(); }
+    std::size_t getBucketCount() const { return map.bucket_count(); }
 
     //
     // Lookup
@@ -225,7 +237,7 @@ public:
     {
         if (const auto x = tryGetValue(key))
             return *x;
-        SLANG_ASSERT_FAILURE("The key does not exist in dictionary.");
+        SLANG_UNEXPECTED("The key does not exist in dictionary.");
     }
 
     // Returns a reference to the value at the given key. Asserts if the
@@ -234,7 +246,7 @@ public:
     {
         if (const auto x = tryGetValue(key))
             return *x;
-        SLANG_ASSERT_FAILURE("The key does not exist in dictionary.");
+        SLANG_UNEXPECTED("The key does not exist in dictionary.");
     }
 
     //
@@ -398,7 +410,9 @@ public:
 
 public:
     auto getCount() const { return dict.getCount(); }
+    auto getBucketCount() const { return dict.getBucketCount(); }
     void clear() { dict.clear(); }
+    void clearAndDeallocate() { dict.clearAndDeallocate(); }
     bool add(const T& obj) { return dict.addIfNotExists(obj, _DummyClass()); }
     bool add(T&& obj) { return dict.addIfNotExists(_Move(obj), _DummyClass()); }
     void remove(const T& obj) { dict.remove(obj); }
@@ -504,7 +518,7 @@ private:
         }
         if (insertPos != -1)
             return FindPositionResult(-1, insertPos);
-        SLANG_ASSERT_FAILURE(
+        SLANG_UNEXPECTED(
             "Hash map is full. This indicates an error in Key::Equal or Key::GetHashCode.");
     }
     TValue& _insert(KeyValuePair<TKey, TValue>&& kvPair, int pos)
@@ -552,9 +566,9 @@ private:
             _insert(_Move(kvPair), pos.insertionPosition);
             return true;
         }
-        else
-            SLANG_ASSERT_FAILURE(
-                "Inconsistent find result returned. This is a bug in Dictionary implementation.");
+
+        SLANG_UNEXPECTED("Inconsistent find result returned. This is a bug in OrderedDictionary "
+                         "implementation.");
     }
     void add(KeyValuePair<TKey, TValue>&& kvPair)
     {
@@ -575,9 +589,9 @@ private:
             m_count++;
             return _insert(_Move(kvPair), pos.insertionPosition);
         }
-        else
-            SLANG_ASSERT_FAILURE(
-                "Inconsistent find result returned. This is a bug in Dictionary implementation.");
+
+        SLANG_UNEXPECTED("Inconsistent find result returned. This is a bug in OrderedDictionary "
+                         "implementation.");
     }
 
 public:
@@ -680,10 +694,8 @@ public:
             {
                 return dict->m_hashMap[pos.objectPosition]->value.value;
             }
-            else
-            {
-                SLANG_ASSERT_FAILURE("The key does not exists in dictionary.");
-            }
+
+            SLANG_UNEXPECTED("The key does not exist in dictionary.");
         }
         inline TValue& operator()() const { return getValue(); }
         operator TValue&() const { return getValue(); }

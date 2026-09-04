@@ -25,7 +25,12 @@ namespace
     x(Int64, int64_t) \
     x(UInt64, uint64_t) \
     x(Float32, float) \
-    x(Float64, double)
+    x(Float64, double) \
+    x(IntPtr, intptr_t) \
+    x(UIntPtr, uintptr_t) \
+    x(BFloat16, bfloat16) \
+    x(FloatE4M3, float_e4m3) \
+    x(FloatE5M2, float_e5m2)
 // clang-format on
 
 struct ScalarTypeInfo
@@ -113,8 +118,9 @@ static const NamesDescriptionValue s_languageInfos[] = {
 
 static const NamesDescriptionValue s_languageVersionInfos[] = {
     {SLANG_LANGUAGE_VERSION_LEGACY, "legacy,default,2018", "Legacy Slang language"},
-    {SLANG_LANGUAGE_VERSION_2025, "2025", "Slang language rules for 2025 and older"},
-    {SLANG_LANGUAGE_VERSION_2026, "2026,latest", "Slang language rules for 2026 and newer"},
+    {SLANG_LANGUAGE_VERSION_2025, "2025,202a", "Slang language rules for 2025 and older"},
+    {SLANG_LANGUAGE_VERSION_2026, "2026,202b,latest", "Slang language rules for 2026"},
+    {SLANG_LANGUAGE_VERSION_202C, "202c,next", "Slang language rules for 202c"},
 };
 
 static const NamesDescriptionValue s_compilerInfos[] = {
@@ -195,7 +201,7 @@ static const NamesDescriptionValue s_optimizationLevels[] = {
     {SLANG_OPTIMIZATION_LEVEL_NONE, "0,none", "Disable all optimizations"},
     {SLANG_OPTIMIZATION_LEVEL_DEFAULT,
      "1,default",
-     "Enable a default level of optimization.This is the default if no -o options are used."},
+     "Enable a default level of optimization.This is the default if no -O options are used."},
     {SLANG_OPTIMIZATION_LEVEL_HIGH, "2,high", "Enable aggressive optimizations for speed."},
     {SLANG_OPTIMIZATION_LEVEL_MAXIMAL,
      "3,maximal",
@@ -204,7 +210,10 @@ static const NamesDescriptionValue s_optimizationLevels[] = {
 };
 
 static const NamesDescriptionValue s_debugLevels[] = {
-    {SLANG_DEBUG_INFO_LEVEL_NONE, "0,none", "Don't emit debug information at all."},
+    {SLANG_DEBUG_INFO_LEVEL_NONE,
+     "0,none",
+     "Don't emit debug information. This is the default. For SPIR-V, OpSource, OpName and "
+     "OpMemberName are still emitted."},
     {SLANG_DEBUG_INFO_LEVEL_MINIMAL,
      "1,minimal",
      "Emit as little debug information as possible, while still supporting stack traces."},

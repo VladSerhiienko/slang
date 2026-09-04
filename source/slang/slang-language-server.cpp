@@ -6,13 +6,14 @@
 
 #include "slang-language-server.h"
 
-#include "../../tools/platform/performance-counter.h"
-#include "../compiler-core/slang-json-native.h"
-#include "../compiler-core/slang-json-rpc-connection.h"
-#include "../compiler-core/slang-language-server-protocol.h"
-#include "../core/slang-char-util.h"
-#include "../core/slang-secure-crt.h"
-#include "../core/slang-string-util.h"
+#include "compiler-core/slang-json-native.h"
+#include "compiler-core/slang-json-rpc-connection.h"
+#include "compiler-core/slang-language-server-protocol.h"
+#include "core/slang-char-util.h"
+#include "core/slang-secure-crt.h"
+#include "core/slang-string-util.h"
+#include "core/slang-type-text-util.h"
+#include "platform/performance-counter.h"
 #include "slang-ast-print.h"
 #include "slang-check-impl.h"
 #include "slang-com-helper.h"
@@ -211,7 +212,7 @@ SlangResult LanguageServer::parseNextMessage()
                 if (response.result.getKind() == JSONValue::Kind::Array)
                 {
                     auto arr = m_connection->getContainer()->getArray(response.result);
-                    if (arr.getCount() == 14)
+                    if (arr.getCount() == 15)
                     {
                         updatePredefinedMacros(arr[0]);
                         updateSearchPaths(arr[1]);
@@ -221,6 +222,7 @@ SlangResult LanguageServer::parseNextMessage()
                         updateInlayHintOptions(arr[10], arr[11]);
                         updateWorkspaceFlavor(arr[12]);
                         updateTraceOptions(arr[13]);
+                        updatePredefinedLanguageVersion(arr[14]);
                     }
                 }
                 break;
@@ -865,7 +867,63 @@ LanguageServerResult<LanguageServerProtocol::Hover> LanguageServerCore::hover(
                 }
             }
         }
-        if (const auto higherOrderExpr = as<HigherOrderInvokeExpr>(expr))
+        else if (auto packQueryExpr = as<PackQueryExpr>(expr))
+        {
+            String queryName = "__trimLast";
+            if (as<FirstExpr>(packQueryExpr))
+                queryName = "__first";
+            else if (as<LastExpr>(packQueryExpr))
+                queryName = "__last";
+            else if (as<TrimFirstExpr>(packQueryExpr))
+                queryName = "__trimFirst";
+
+            sb << "```\n" << queryName << "(";
+            if (packQueryExpr->value && packQueryExpr->value->type)
+            {
+                ASTPrinter printer(version->linkage->getASTBuilder());
+                printer.addExpr(packQueryExpr->value);
+                sb << printer.getString();
+            }
+            sb << ")";
+            if (expr->type)
+            {
+                sb << " : ";
+                if (auto typeType = as<TypeType>(expr->type))
+                    typeType->getType()->toText(sb);
+                else
+                    expr->type.type->toText(sb);
+            }
+            sb << "\n```\n";
+            fillLoc(expr->loc);
+        }
+        else if (auto shapePackExpr = as<ShapePackTransformExpr>(expr))
+        {
+            auto opName = getShapePackTransformName(shapePackExpr);
+            sb << "```\n" << opName << "(";
+            bool isFirst = true;
+            ASTPrinter printer(version->linkage->getASTBuilder());
+            for (auto arg : shapePackExpr->args)
+            {
+                if (!isFirst)
+                    sb << ", ";
+                printer.reset();
+                printer.addExpr(arg);
+                sb << printer.getString();
+                isFirst = false;
+            }
+            sb << ")";
+            if (expr->type)
+            {
+                sb << " : ";
+                if (auto typeType = as<TypeType>(expr->type))
+                    typeType->getType()->toText(sb);
+                else
+                    expr->type.type->toText(sb);
+            }
+            sb << "\n```\n";
+            fillLoc(expr->loc);
+        }
+        if (const auto higherOrderExpr = as<HigherOrderInvokeExpr>(expr); higherOrderExpr)
         {
             String documentation;
             String signature = getExprDeclSignature(expr, &documentation, nullptr);
@@ -906,6 +964,14 @@ LanguageServerResult<LanguageServerProtocol::Hover> LanguageServerCore::hover(
     else if (auto countOfExpr = as<CountOfExpr>(leafNode))
     {
         fillExprHoverInfo(countOfExpr);
+    }
+    else if (auto packQueryExpr = as<PackQueryExpr>(leafNode))
+    {
+        fillExprHoverInfo(packQueryExpr);
+    }
+    else if (auto shapePackExpr = as<ShapePackTransformExpr>(leafNode))
+    {
+        fillExprHoverInfo(shapePackExpr);
     }
     else if (auto swizzleExpr = as<SwizzleExpr>(leafNode))
     {
@@ -2425,6 +2491,42 @@ void LanguageServer::updateWorkspaceFlavor(const JSONValue& value)
     }
 }
 
+// Apply the `slang.predefinedLanguageVersion` client setting (a version string such as "2025"):
+// map it via the same TypeTextUtil::findLanguageVersion path the `-std`/`-language-version` option
+// uses, store it on the workspace, and refresh open documents if it changed. An empty value clears
+// the setting (UNKNOWN, compiler default); an unrecognized non-empty value is logged and the
+// previously configured version is left in place, so a typo does not silently disable a working
+// configuration.
+void LanguageServer::updatePredefinedLanguageVersion(const JSONValue& value)
+{
+    if (value.isValid())
+    {
+        auto container = m_connection->getContainer();
+        JSONToNativeConverter converter(container, &m_typeMap, m_connection->getSink());
+        String str;
+        if (SLANG_SUCCEEDED(converter.convert(value, &str)))
+        {
+            SlangLanguageVersion version = SLANG_LANGUAGE_VERSION_UNKNOWN;
+            if (str.getLength() != 0)
+            {
+                version = TypeTextUtil::findLanguageVersion(str.getUnownedSlice());
+                if (version == SLANG_LANGUAGE_VERSION_UNKNOWN)
+                {
+                    logMessage(
+                        2 /* warning */,
+                        String("slang.predefinedLanguageVersion: unknown language version '") +
+                            str + "'; keeping the previous setting.");
+                    return;
+                }
+            }
+            if (m_core.m_workspace->updatePredefinedLanguageVersion(version))
+            {
+                sendRefreshRequests(m_connection);
+            }
+        }
+    }
+}
+
 void LanguageServer::sendConfigRequest()
 {
     ConfigurationParams args;
@@ -2456,6 +2558,8 @@ void LanguageServer::sendConfigRequest()
     item.section = "slang.workspaceFlavor";
     args.items.add(item);
     item.section = "slangLanguageServer.trace.server";
+    args.items.add(item);
+    item.section = "slang.predefinedLanguageVersion";
     args.items.add(item);
     m_connection->sendCall(
         ConfigurationParams::methodName,
@@ -3040,6 +3144,10 @@ void LanguageServer::updateConfigFromJSON(const JSONValue& jsonVal)
         else if (key == "slang.workspaceFlavor")
         {
             updateWorkspaceFlavor(kv.value);
+        }
+        else if (key == "slang.predefinedLanguageVersion")
+        {
+            updatePredefinedLanguageVersion(kv.value);
         }
     }
 }

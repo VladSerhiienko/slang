@@ -55,9 +55,9 @@ Member list:
   - *`subscript-op-decl`* is a [subscript operator declaration](#subscript-op).
   - *`function-call-op-decl`* is a [function call operator declaration](#function-call-op).
 
-> ⚠️ **Warning:** `Slangc` currently accepts bracketed attributes right after the **`'struct'`** keyword. This
-> is deprecated syntax and expected to be removed. Bracketed attributes should be added in *`modifier-list`*,
-> instead. ([Issue #9691](https://github.com/shader-slang/slang/issues/9691))
+> ⚠️ **Warning:** The syntax for bracketed attributes list after **`'struct'`** was deprecated in Slang 2025,
+> and it has been removed in Slang 2026. Add bracketed attributes in *`modifier-list`* before the
+> **`'struct'`** keyword, instead. ([Issue #9691](https://github.com/shader-slang/slang/issues/9691))
 
 
 ## Description
@@ -123,7 +123,9 @@ A structure may conform to one or more [interface](types-interface.md) types.
 A structure may be extended with a [type extension](types-extension.md).
 
 `struct` members may be declared with access control specifiers `public`, `internal`, or `private` (specified
-in *`modifier-list`*). The default member visibility is `internal`. Nested `struct` members have access to
+in *`modifier-list`*). The default member visibility is `internal`, except that starting with language version
+2026 a member with no explicit specifier inherits the visibility of its enclosing `struct` (so an unmodified
+member of a `public` struct is `public`). Nested `struct` members have access to
 `private` members of the enclosing `struct`. See [access control (TODO)](TODO) for further information.
 
 

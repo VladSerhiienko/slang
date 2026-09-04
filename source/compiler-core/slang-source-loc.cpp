@@ -1,9 +1,9 @@
 // slang-source-loc.cpp
 #include "slang-source-loc.h"
 
-#include "../core/slang-char-encode.h"
-#include "../core/slang-string-escape-util.h"
-#include "../core/slang-string-util.h"
+#include "core/slang-char-encode.h"
+#include "core/slang-string-escape-util.h"
+#include "core/slang-string-util.h"
 #include "slang-artifact-desc-util.h"
 #include "slang-artifact-impl.h"
 #include "slang-artifact-representation-impl.h"
@@ -466,12 +466,17 @@ PathInfo SourceView::getPathInfo(SourceLoc loc, SourceLocType type)
 
 void SourceFile::setLineBreakOffsets(const uint32_t* offsets, UInt numOffsets)
 {
+    // Keep manual cache updates consistent with readers scanning the same SourceFile.
+    std::lock_guard<std::mutex> lock(m_cacheMutex);
     m_lineBreakOffsets.clear();
     m_lineBreakOffsets.addRange(offsets, numOffsets);
 }
 
 const List<uint32_t>& SourceFile::getLineBreakOffsets()
 {
+    // Multiple threads can race the first line-break scan for the same SourceFile.
+    std::lock_guard<std::mutex> lock(m_cacheMutex);
+
     // We now have a raw input file that we can search for line breaks.
     // We obviously don't want to do a linear scan over and over, so we will
     // cache an array of line break locations in the file.
@@ -611,13 +616,10 @@ int SourceFile::calcColumnIndex(int lineIndex, int offset, int tabSize)
 
 /* !!!!!!!!!!!!!!!!!!!!!!!!! SourceFile !!!!!!!!!!!!!!!!!!!!!!!!!!!! */
 
-void SourceFile::setContents(ISlangBlob* blob)
+ComPtr<ISlangBlob> SourceFile::decodeContentBlob(ISlangBlob* rawBlob)
 {
-    const UInt rawContentSize = blob->getBufferSize();
-
-    SLANG_ASSERT(rawContentSize == m_contentSize);
-
-    Byte* rawContentBegin = (Byte*)blob->getBufferPointer();
+    const UInt rawContentSize = rawBlob->getBufferSize();
+    const Byte* rawContentBegin = (const Byte*)rawBlob->getBufferPointer();
 
     // Query the encoding type and discard the Unicode Byte-Order-Marker before decoding
     size_t offset;
@@ -627,29 +629,38 @@ void SourceFile::setContents(ISlangBlob* blob)
     if (offset == 0 && type == CharEncodeType::UTF8)
     {
         // Fast-path: If the input is UTF-8 without a BOM, we can use it directly.
-        m_contentBlob = blob;
+        return ComPtr<ISlangBlob>(rawBlob);
     }
-    else
-    {
-        // Slow path: Allocate and decode a new buffer for the data, then move that into
-        // m_contentBlob.
-        List<char> decodedBuffer;
-        CharEncoding::getEncoding(type)->decode(
-            rawContentBegin + offset,
-            int(rawContentSize - offset),
-            decodedBuffer);
 
-        auto size = decodedBuffer.getCount();
-        ScopedAllocation temp;
-        temp.attach(decodedBuffer.detachBuffer(), size);
-        m_contentBlob = RawBlob::moveCreate(temp);
-    }
+    // Slow path: Allocate and decode a new buffer for the data, then move that into a fresh blob.
+    List<char> decodedBuffer;
+    CharEncoding::getEncoding(type)->decode(
+        rawContentBegin + offset,
+        int(rawContentSize - offset),
+        decodedBuffer);
+
+    auto size = decodedBuffer.getCount();
+    ScopedAllocation temp;
+    temp.attach(decodedBuffer.detachBuffer(), size);
+    return RawBlob::moveCreate(temp);
+}
+
+void SourceFile::setContents(ISlangBlob* blob)
+{
+    SLANG_ASSERT(blob->getBufferSize() == m_contentSize);
+
+    m_contentBlob = decodeContentBlob(blob);
 
     char const* decodedContentBegin = (char const*)m_contentBlob->getBufferPointer();
     const UInt decodedContentSize = m_contentBlob->getBufferSize();
     char const* decodedContentEnd = decodedContentBegin + decodedContentSize;
 
     m_content = UnownedStringSlice(decodedContentBegin, decodedContentEnd);
+
+    // Update m_contentSize to the decoded size so that getContentSize() always reflects the
+    // actual content length. For UTF-8 without BOM this is a no-op; for BOM or non-UTF-8 files,
+    // the decoded size may differ from the raw file size.
+    m_contentSize = decodedContentSize;
 }
 
 void SourceFile::setContents(const String& content)
@@ -667,6 +678,9 @@ SourceFile::~SourceFile() {}
 
 SHA1::Digest SourceFile::getDigest()
 {
+    // The digest is another lazy SourceFile cache that may be queried concurrently.
+    std::lock_guard<std::mutex> lock(m_cacheMutex);
+
     if (m_digest == SHA1::Digest())
     {
         DigestBuilder<SHA1> builder;

@@ -6,7 +6,7 @@
 // central to many parts of the Slang compiler codebase.
 //
 
-#include "../core/slang-string-util.h"
+#include "core/slang-string-util.h"
 #include "slang-ast-builder.h"
 #include "slang-entry-point.h"
 #include "slang-linkable.h"
@@ -198,7 +198,7 @@ public:
     virtual SLANG_NO_THROW SlangResult SLANG_MCALL linkWithOptions(
         slang::IComponentType** outLinkedComponentType,
         uint32_t count,
-        slang::CompilerOptionEntry* entries,
+        slang::CompilerOptionEntry const* entries,
         ISlangBlob** outDiagnostics) override
     {
         return Super::linkWithOptions(outLinkedComponentType, count, entries, outDiagnostics);
@@ -304,6 +304,13 @@ public:
 
     void setDigest(SHA1::Digest const& digest) { m_digest = digest; }
     SHA1::Digest computeDigest();
+
+    /// Set / get a digest of the raw source that produced this module.
+    ///
+    /// Populated for source blobs and source files so that subsequent load
+    /// attempts with the same module name can be compared for equivalence.
+    void setSourceDigest(SHA1::Digest const& digest) { m_sourceDigest = digest; }
+    SHA1::Digest const& getSourceDigest() const { return m_sourceDigest; }
 
     /// Create a module (initially empty).
     Module(Linkage* linkage, ASTBuilder* astBuilder = nullptr);
@@ -414,7 +421,7 @@ public:
     /// TODO: We might eventually consider a non-stateful approach
     /// to constructing a `Module`.
     ///
-    void _collectShaderParams();
+    void _collectShaderParams(DiagnosticSink* sink);
 
     void _discoverEntryPoints(DiagnosticSink* sink, const List<RefPtr<TargetRequest>>& targets);
     void _discoverEntryPointsImpl(
@@ -479,6 +486,11 @@ private:
 
     // A digest that uniquely identifies the contents of the module.
     SHA1::Digest m_digest;
+
+    // Digest of the raw source blob that produced this module, when loaded via
+    // `Linkage::loadModuleFromBlob`.  Zero-initialised for modules that were not
+    // loaded from a source blob (e.g. loaded from disk).
+    SHA1::Digest m_sourceDigest{};
 
     // List of modules this module depends on
     ModuleDependencyList m_moduleDependencyList;

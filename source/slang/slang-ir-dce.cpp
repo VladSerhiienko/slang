@@ -80,11 +80,7 @@ struct DeadCodeEliminationContext
         if (!undefInst)
         {
             IRBuilder builder(module);
-            if (auto firstChild = module->getModuleInst()->getFirstChild())
-                builder.setInsertBefore(firstChild);
-            else
-                builder.setInsertInto(module->getModuleInst());
-            undefInst = Slang::getUnitPoisonVal(builder, module);
+            undefInst = Slang::getUnitPoisonVal(&builder);
         }
         return undefInst;
     }
@@ -239,8 +235,26 @@ struct DeadCodeEliminationContext
             // because they must have been dead too (since we always
             // mark the parent of a live instruction as live).
             //
+
+            //
+            // We'll also remove any annotations on this inst.
+            //
+            // Annotations are always treated as live even if they
+            // have no uses, so we'll need to be explicit about removing
+            // them.
+            //
+            // TODO: Would it be better to do this during removeAndDeallocate()
+            // instead?
+            //
             if (inst->hasUses())
             {
+                traverseUsers<IRAnnotation>(
+                    inst,
+                    [&](IRAnnotation* annotation)
+                    {
+                        if (annotation->getTarget() == inst)
+                            annotation->removeAndDeallocate();
+                    });
                 inst->replaceUsesWith(getUnitPoisonVal());
             }
 
@@ -316,41 +330,6 @@ bool isFieldUsed(IRStructField* fieldInst)
 
         if (as<IRFieldExtract>(use->getUser()))
             return true;
-    }
-
-    // Check fields that have this field as a sub-field.
-    auto parentType = cast<IRStructType>(fieldInst->getParent());
-
-    if (as<IRModuleInst>(parentType->getParent()))
-    {
-        for (auto use = parentType->firstUse; use; use = use->nextUse)
-        {
-            auto useField = as<IRStructField>(use->getUser());
-            if (useField && isFieldUsed(useField))
-                return true;
-        }
-    }
-    else if (as<IRBlock>(parentType->getParent()))
-    {
-        if (auto genericParentType = as<IRGeneric>(parentType->getParent()))
-        {
-            List<IRSpecialize*> specInsts;
-            for (auto use = genericParentType->firstUse; use; use = use->nextUse)
-            {
-                if (auto specInst = as<IRSpecialize>(use->getUser()))
-                    specInsts.add(specInst);
-            }
-
-            for (auto specInst : specInsts)
-            {
-                for (auto use = specInst->firstUse; use; use = use->nextUse)
-                {
-                    auto useField = as<IRStructField>(use->getUser());
-                    if (useField && isFieldUsed(useField))
-                        return true;
-                }
-            }
-        }
     }
 
     return false;
@@ -537,7 +516,7 @@ bool shouldInstBeLiveIfParentIsLive(IRInst* inst, IRDeadCodeEliminationOptions o
                                                       ? SideEffectAnalysisOptions::None
                                                       : SideEffectAnalysisOptions::UseDominanceTree;
 
-    if (inst->mightHaveSideEffects(sideEffectOptions))
+    if (inst->mightHaveSideEffects(sideEffectOptions, options.calleeSideEffectCache))
     {
         return true;
     }
@@ -576,6 +555,9 @@ bool shouldInstBeLiveIfParentIsLive(IRInst* inst, IRDeadCodeEliminationOptions o
         {
             innerInst = findInnerMostGenericReturnVal(genInst);
         }
+        // TODO: PR #9808 (Sai Praveen Bangaru) removed the loop over innerInst->getDecorations()
+        // that set shouldKeptAliveIfImported, leaving innerInst unused.
+        SLANG_UNUSED(innerInst);
         for (auto decor : inst->getDecorations())
         {
             switch (decor->getOp())
@@ -587,22 +569,6 @@ bool shouldInstBeLiveIfParentIsLive(IRInst* inst, IRDeadCodeEliminationOptions o
                 break;
             }
         }
-
-        if (innerInst)
-        {
-            for (auto decor : innerInst->getDecorations())
-            {
-                switch (decor->getOp())
-                {
-                case kIROp_ForwardDerivativeDecoration:
-                case kIROp_UserDefinedBackwardDerivativeDecoration:
-                case kIROp_PrimalSubstituteDecoration:
-                    shouldKeptAliveIfImported = true;
-                    break;
-                }
-            }
-        }
-
         if (isImported && shouldKeptAliveIfImported)
             return true;
     }
@@ -681,9 +647,28 @@ bool isWeakReferenceOperand(IRInst* inst, UInt operandIndex)
         if (inst->getOperand(operandIndex)->getOp() == kIROp_WitnessTable)
             return true;
         break;*/
-    case kIROp_SpecializationDictionaryItem:
-        // Ignore all operands of SpecializationDictionaryItem.
-        // This inst is used as a cache and shouldn't hold anything alive.
+    case kIROp_WeakUse:
+        return true;
+    case kIROp_ReportCheckpointStore:
+        // operand 2 (storeRef) is a weak reference to the store address.
+        // If the store is optimized out, this operand becomes poison.
+        if (operandIndex == 2)
+            return true;
+        break;
+    case kIROp_Annotation:
+        if (operandIndex == 0)
+            return true;
+        break;
+    case kIROp_CompilerDictionaryEntry:
+        // Dictionary entries use operand 1 as the opcode discriminator for the cached translation.
+        // Keep that single key operand strong so DCE cannot collect and recreate the opcode
+        // literal, while all IR-value keys remain weak cache references.
+        if (operandIndex != 1)
+            return true;
+        break;
+    case kIROp_CompilerDictionaryValue:
+        // Compiler dictionaries cache translation results; their operands should not keep the
+        // cached IR alive after the real uses have been specialized away.
         return true;
     default:
         break;
@@ -700,6 +685,9 @@ bool eliminateDeadCode(IRModule* module, IRDeadCodeEliminationOptions const& opt
     DeadCodeEliminationContext context;
     context.module = module;
     context.options = options;
+    Dictionary<IRInst*, bool> calleeSideEffectCache;
+    if (!context.options.calleeSideEffectCache)
+        context.options.calleeSideEffectCache = &calleeSideEffectCache;
     return context.processModule();
 }
 
@@ -708,6 +696,9 @@ bool eliminateDeadCode(IRInst* root, IRDeadCodeEliminationOptions const& options
     DeadCodeEliminationContext context;
     context.module = root->getModule();
     context.options = options;
+    Dictionary<IRInst*, bool> calleeSideEffectCache;
+    if (!context.options.calleeSideEffectCache)
+        context.options.calleeSideEffectCache = &calleeSideEffectCache;
     return context.processInst(root);
 }
 

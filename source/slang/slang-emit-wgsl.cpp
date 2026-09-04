@@ -1,5 +1,6 @@
 #include "slang-emit-wgsl.h"
 
+#include "core/slang-type-text-util.h"
 #include "slang-ir-layout.h"
 #include "slang-ir-util.h"
 #include "slang-rich-diagnostics.h"
@@ -57,6 +58,17 @@ WGSLSourceEmitter::WGSLSourceEmitter(const Desc& desc)
     m_extensionTracker =
         dynamicCast<ShaderExtensionTracker>(desc.codeGenContext->getExtensionTracker());
     SLANG_ASSERT(m_extensionTracker);
+}
+
+void WGSLSourceEmitter::emitTempModifiers(IRInst* temp)
+{
+    // WGSL has no `precise` keyword; drop it and warn.
+    if (temp->findDecoration<IRPreciseDecoration>())
+    {
+        getSink()->diagnose(Diagnostics::PreciseQualifierUnsupportedOnTarget{
+            .target = TypeTextUtil::getCompileTargetName(SlangCompileTarget(getTarget())),
+            .location = temp->sourceLoc});
+    }
 }
 
 void WGSLSourceEmitter::emitSwitchCaseSelectorsImpl(
@@ -143,7 +155,7 @@ void WGSLSourceEmitter::emitParameterGroupImpl(
         case LayoutResourceKind::SamplerState:
         case LayoutResourceKind::DescriptorTableSlot:
             {
-                auto kinds = LayoutResourceKindFlag::make(LayoutResourceKind::DescriptorTableSlot);
+                auto kinds = LayoutResourceKindFlag::make(kind);
                 m_writer->emit("@binding(");
                 auto index = getBindingOffsetForKinds(&containerChain, kinds);
                 m_writer->emit(index);
@@ -356,6 +368,28 @@ void WGSLSourceEmitter::emit(const AddressSpace addressSpace)
     }
 }
 
+static ImageFormat getImageFormat(IRTextureType* texType)
+{
+    return texType->hasFormat() ? (ImageFormat)getIntVal(texType->getFormat())
+                                : ImageFormat::unknown;
+}
+
+static bool wgslFormatSupportsReadWrite(ImageFormat fmt)
+{
+    // Per https://www.w3.org/TR/WGSL/#storage-texel-formats, rgba16float is explicitly
+    // prohibited from read_write access even when the readonly_and_readwrite_storage_textures
+    // WGSL feature is available. All other formats that Slang's WGSL backend emits
+    // (r32float, rg32float, rgba32float, rgba8unorm, bgra8unorm, and their integer
+    // variants) support read_write under that feature.
+    switch (fmt)
+    {
+    case ImageFormat::rgba16f:
+        return false;
+    default:
+        return true;
+    }
+}
+
 const char* WGSLSourceEmitter::getWgslImageFormat(IRTextureTypeBase* type)
 {
     // You can find the supported WGSL texel format from the URL:
@@ -516,10 +550,8 @@ void WGSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
         m_writer->emit("u32");
         break;
     case kIROp_UInt64Type:
-        {
-            m_writer->emit(getDefaultBuiltinTypeName(type->getOp()));
-            return;
-        }
+        m_writer->emit("u64");
+        return;
     case kIROp_Int16Type:
         diagnoseOnce(Diagnostics::Int16NotSupportedInWgsl{.typeName = "int16_t"});
         return;
@@ -650,8 +682,19 @@ void WGSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
                 switch (texType->getAccess())
                 {
                 case SLANG_RESOURCE_ACCESS_READ_WRITE:
-                    m_writer->emit(getWgslImageFormat(texType));
-                    m_writer->emit(", read_write");
+                    {
+                        ImageFormat fmt = getImageFormat(texType);
+                        const char* fmtStr = getWgslImageFormat(texType);
+                        if (!wgslFormatSupportsReadWrite(fmt))
+                        {
+                            getSink()->diagnose(
+                                Diagnostics::StorageTextureAccessModeNotSupportedInWgsl{
+                                    .format = fmtStr,
+                                    .accessMode = "read_write"});
+                        }
+                        m_writer->emit(fmtStr);
+                        m_writer->emit(", read_write");
+                    }
                     break;
                 case SLANG_RESOURCE_ACCESS_WRITE:
                     m_writer->emit(getWgslImageFormat(texType));
@@ -680,6 +723,16 @@ void WGSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
     case kIROp_ConstantBufferType:
         {
             emitType((IRType*)type->getOperand(0));
+            return;
+        }
+    case kIROp_AttributedType:
+        {
+            // An attribute (`unorm`/`snorm`, `no_diff`) is a semantic marker that
+            // does not change representation and has no WGSL spelling, so the type
+            // is emitted as its base. Without this, a `unorm float` used as a
+            // struct member or structured-buffer element type reaches here and the
+            // `default` arm emits nothing, producing invalid WGSL (`array<>`).
+            emitType(cast<IRAttributedType>(type)->getBaseType());
             return;
         }
     default:
@@ -714,28 +767,35 @@ void WGSLSourceEmitter::emitLayoutQualifiersImpl(IRVarLayout* layout)
         // @binding and @group unique, so that we can pass WGSL compile tests.
         // This will have to be revisited when we actually want to supply resources to
         // shaders.
-        if (kind == LayoutResourceKind::DescriptorTableSlot)
+        switch (kind)
         {
-            m_writer->emit("@binding(");
-            m_writer->emit(attr->getOffset());
-            m_writer->emit(") ");
+        case LayoutResourceKind::DescriptorTableSlot:
+        case LayoutResourceKind::ShaderResource:
+        case LayoutResourceKind::UnorderedAccess:
+        case LayoutResourceKind::SamplerState:
+        case LayoutResourceKind::ConstantBuffer:
+            {
+                m_writer->emit("@binding(");
+                m_writer->emit(attr->getOffset());
+                m_writer->emit(") ");
 
-            EmitVarChain chain = {};
-            chain.varLayout = layout;
-            auto space = getBindingSpaceForKinds(&chain, LayoutResourceKindFlag::make(kind));
-            m_writer->emit("@group(");
-            m_writer->emit(space);
-            m_writer->emit(") ");
+                EmitVarChain chain = {};
+                chain.varLayout = layout;
+                auto space = getBindingSpaceForKinds(&chain, LayoutResourceKindFlag::make(kind));
+                m_writer->emit("@group(");
+                m_writer->emit(space);
+                m_writer->emit(") ");
 
-            return;
-        }
-        else if (kind == LayoutResourceKind::SpecializationConstant)
-        {
+                return;
+            }
+        case LayoutResourceKind::SpecializationConstant:
             m_writer->emit("@id(");
             m_writer->emit(attr->getOffset());
             m_writer->emit(") ");
 
             return;
+        default:
+            break;
         }
     }
 }
@@ -770,6 +830,20 @@ static bool isStaticConst(IRInst* inst)
 
 void WGSLSourceEmitter::emitVarKeywordImpl(IRType* type, IRInst* varDecl)
 {
+    // A module-scope `static const` array is emitted as `var<private>`, not `const`: a WGSL
+    // `const` value of array type may only be indexed by a const-expression, so a constant array
+    // indexed by a runtime value (e.g. `positions[SV_VertexID]`) is rejected by the validator. A
+    // `var<private>` takes the same const-expression initializer but, being addressable, is
+    // runtime-indexable. Only arrays are converted -- a scalar/vector/matrix *value* is already
+    // runtime-indexable in WGSL. The type-based conversion is safe because constant-indexed reads
+    // fold away before emit (see the PR description). The `!= kIROp_GlobalParam` guard is
+    // load-bearing: this predicate is reused in the address-space chain below, where a
+    // `GlobalParam` array (e.g. a descriptor array) must keep its own address space, not
+    // `<private>`.
+    const bool emitModuleScopeArrayConstAsPrivateVar = isStaticConst(varDecl) &&
+                                                       varDecl->getOp() != kIROp_GlobalParam &&
+                                                       type->getOp() == kIROp_ArrayType;
+
     switch (varDecl->getOp())
     {
     case kIROp_GlobalParam:
@@ -786,7 +860,12 @@ void WGSLSourceEmitter::emitVarKeywordImpl(IRType* type, IRInst* varDecl)
         }
         break;
     default:
-        if (isStaticConst(varDecl))
+        // When this emits `var`, the matching `<private>` address space is emitted by the
+        // storage-space chain below (the two must stay in lockstep — a module-scope `var`
+        // without an address space is invalid WGSL).
+        if (emitModuleScopeArrayConstAsPrivateVar)
+            m_writer->emit("var");
+        else if (isStaticConst(varDecl))
             m_writer->emit("const");
         else
             m_writer->emit("var");
@@ -805,6 +884,19 @@ void WGSLSourceEmitter::emitVarKeywordImpl(IRType* type, IRInst* varDecl)
         m_writer->emit("<uniform>");
     }
     else if (
+        type->getOp() == kIROp_ArrayType &&
+        (as<IRHLSLStructuredBufferTypeBase>((IRType*)type->getOperand(0)) ||
+         as<IRByteAddressBufferTypeBase>((IRType*)type->getOperand(0))))
+    {
+        // Arrays of structured/byte-address buffers are not representable in WGSL
+        // because the buffer types themselves map to runtime-sized arrays, and WGSL
+        // does not allow runtime-sized arrays as element types of fixed-size arrays.
+        diagnoseOnce(
+            Diagnostics::ArrayOfResourceTypeNotSupportedInWgsl{.location = varDecl->sourceLoc});
+        // Emit a placeholder to avoid cascading errors in the emitter.
+        m_writer->emit("<storage, read_write>");
+    }
+    else if (
         type->getOp() == kIROp_HLSLRWStructuredBufferType ||
         type->getOp() == kIROp_HLSLRasterizerOrderedStructuredBufferType ||
         type->getOp() == kIROp_HLSLRWByteAddressBufferType)
@@ -821,9 +913,11 @@ void WGSLSourceEmitter::emitVarKeywordImpl(IRType* type, IRInst* varDecl)
         m_writer->emit("storage, read");
         m_writer->emit(">");
     }
-    else if (varDecl->getOp() == kIROp_GlobalVar)
+    else if (varDecl->getOp() == kIROp_GlobalVar || emitModuleScopeArrayConstAsPrivateVar)
     {
-        // Global ("module-scope") non-handle variables need to specify storage space
+        // Global ("module-scope") non-handle variables need to specify storage space. This also
+        // covers an array constant converted to `var<private>` above (which is not a GlobalVar
+        // but is likewise emitted as a module-scope private variable).
 
         // https://www.w3.org/TR/WGSL/#var-decls
         // "
@@ -1413,6 +1507,27 @@ bool WGSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
             return true;
         }
 
+    case kIROp_IntCast:
+        {
+            // Emit a bool->int cast with `select`, the emitter's idiom for bool-conditioned
+            // values (cf. the `And`/`Or` case); `select(T(0), T(1), cond)` maps false->0, true->1.
+            auto operand = inst->getOperand(0);
+            if (as<IRBoolType>(getVectorElementType(operand->getDataType())))
+            {
+                auto type = inst->getDataType();
+                m_writer->emit("select(");
+                emitType(type);
+                m_writer->emit("(0), ");
+                emitType(type);
+                m_writer->emit("(1), ");
+                emitOperand(operand, getInfo(EmitOp::General));
+                m_writer->emit(")");
+                return true;
+            }
+            return false;
+        }
+        break;
+
     case kIROp_BitCast:
         {
             // In WGSL there is a built-in bitcast function!
@@ -1575,7 +1690,9 @@ bool WGSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
     case kIROp_GetStringHash:
         {
             auto getStringHashInst = as<IRGetStringHash>(inst);
-            auto stringLit = getStringHashInst->getStringLit();
+            // Checked, unlike `getStringLit()`, so a non-literal operand reaches the
+            // unhandled-inst path below instead of being read as string data.
+            auto stringLit = as<IRStringLit>(getStringHashInst->getOperand(0));
 
             if (stringLit)
             {

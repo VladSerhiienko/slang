@@ -1,11 +1,11 @@
 // test-context.cpp
 #include "test-context.h"
 
-#include "../../source/compiler-core/slang-language-server-protocol.h"
-#include "../../source/core/slang-io.h"
-#include "../../source/core/slang-shared-library.h"
-#include "../../source/core/slang-string-util.h"
-#include "../../source/core/slang-test-tool-util.h"
+#include "compiler-core/slang-language-server-protocol.h"
+#include "core/slang-io.h"
+#include "core/slang-shared-library.h"
+#include "core/slang-string-util.h"
+#include "core/slang-test-tool-util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,14 +14,46 @@ using namespace Slang;
 
 thread_local int slangTestThreadIndex = 0;
 
+// Number of consecutive failures across all threads before aborting.
+// When GPU driver crashes, all threads fail simultaneously so this triggers quickly.
+static constexpr int kConsecutiveFailureAbortThreshold = 32;
+static std::atomic<int> s_consecutiveFailures{0};
+static constexpr Int kMaxRPCConnectionTimeoutInMs = 24 * 60 * 60 * 1000;
+
 TestContext::TestContext()
 {
-    /// if we are testing on arm, debug, we may want to increase the connection timeout
+    /// If we are testing on arm, debug, we may want to increase the connection timeout.
 #if (SLANG_PROCESSOR_ARM || SLANG_PROCESSOR_ARM_64) && defined(_DEBUG)
     // 10 mins(!). This seems to be the order of time needed for timeout on a CI ARM test system on
     // debug
     connectionTimeOutInMs = 1000 * 60 * 10;
+#elif SLANG_WINDOWS_FAMILY && defined(_DEBUG)
+    // Windows debug CI can spend more than two minutes in individual test-server requests.
+    connectionTimeOutInMs = 1000 * 60 * 5;
 #endif
+
+    StringBuilder rpcTimeoutEnvValue;
+    if (SLANG_SUCCEEDED(PlatformUtil::getEnvironmentVariable(
+            UnownedStringSlice::fromLiteral("SLANG_TEST_RPC_TIMEOUT_MS"),
+            rpcTimeoutEnvValue)))
+    {
+        Int64 rpcTimeoutInMs = 0;
+        if (SLANG_SUCCEEDED(
+                StringUtil::parseInt64(rpcTimeoutEnvValue.getUnownedSlice(), rpcTimeoutInMs)) &&
+            rpcTimeoutInMs > 0 && rpcTimeoutInMs <= kMaxRPCConnectionTimeoutInMs)
+        {
+            connectionTimeOutInMs = Int(rpcTimeoutInMs);
+        }
+        else
+        {
+            String maxTimeoutInMs = String(kMaxRPCConnectionTimeoutInMs);
+            StdWriters::getError().print(
+                "warning: ignoring invalid SLANG_TEST_RPC_TIMEOUT_MS value '%s' "
+                "(expected 1..%s milliseconds)\n",
+                rpcTimeoutEnvValue.getBuffer(),
+                maxTimeoutInMs.getBuffer());
+        }
+    }
 }
 
 void TestContext::setThreadIndex(int index)
@@ -32,6 +64,11 @@ void TestContext::setThreadIndex(int index)
 void TestContext::setMaxTestRunnerThreadCount(int count)
 {
     m_jsonRpcConnections.setCount(count);
+    m_rpcRequestOrdinals.setCount(count);
+    for (auto& ordinal : m_rpcRequestOrdinals)
+    {
+        ordinal = 0;
+    }
     m_testRequirements.setCount(count);
     m_reporters.setCount(count);
     for (auto& reporter : m_reporters)
@@ -60,7 +97,7 @@ TestReporter* TestContext::getTestReporter()
     return m_reporters[slangTestThreadIndex];
 }
 
-SlangResult TestContext::locateFileCheck()
+SlangResult TestContext::locateLLVMFileCheck()
 {
     DefaultSharedLibraryLoader* loader = DefaultSharedLibraryLoader::getSingleton();
 
@@ -89,8 +126,6 @@ Result TestContext::init(const char* inExePath)
     exePath = inExePath;
     SLANG_RETURN_ON_FAIL(TestToolUtil::getExeDirectoryPath(inExePath, exeDirectoryPath));
     SLANG_RETURN_ON_FAIL(TestToolUtil::getDllDirectoryPath(inExePath, dllDirectoryPath));
-
-    SLANG_RETURN_ON_FAIL(locateFileCheck());
 
     return SLANG_OK;
 }
@@ -196,11 +231,21 @@ SlangResult TestContext::_createJSONRPCConnection(RefPtr<JSONRPCConnection>& out
     {
         CommandLine cmdLine;
         cmdLine.setExecutableLocation(ExecutableLocation(exeDirectoryPath, "test-server"));
+        cmdLine.addArg("-parent-pid");
+        cmdLine.addArg(String(Process::getId()));
 
-        if (options.ignoreAbortMsg)
+#if defined(_WIN32)
+        // Hidden integration-test hook. stdout is the JSON-RPC channel, so the test-server parent
+        // monitor test uses a named event instead of emitting a sentinel line.
+        StringBuilder parentMonitorReadyEventName;
+        if (SLANG_SUCCEEDED(PlatformUtil::getEnvironmentVariable(
+                UnownedStringSlice::fromLiteral("SLANG_TEST_PARENT_MONITOR_READY_EVENT"),
+                parentMonitorReadyEventName)))
         {
-            cmdLine.addArg("-ignore-abort-msg");
+            cmdLine.addArg("-parent-monitor-ready-event");
+            cmdLine.addArg(parentMonitorReadyEventName.produceString());
         }
+#endif
 
         SLANG_RETURN_ON_FAIL(Process::create(
             cmdLine,
@@ -259,6 +304,14 @@ void TestContext::destroyRPCConnection()
         m_jsonRpcConnections[slangTestThreadIndex]->disconnect();
         m_jsonRpcConnections[slangTestThreadIndex].setNull();
     }
+    // The next server starts at zero: the ordinal measures the age of one server process,
+    // not of the thread.
+    m_rpcRequestOrdinals[slangTestThreadIndex] = 0;
+}
+
+int TestContext::advanceRPCRequestOrdinal()
+{
+    return ++m_rpcRequestOrdinals[slangTestThreadIndex];
 }
 
 Slang::JSONRPCConnection* TestContext::getOrCreateJSONRPCConnection()
@@ -269,6 +322,9 @@ Slang::JSONRPCConnection* TestContext::getOrCreateJSONRPCConnection()
         {
             return nullptr;
         }
+        // Paired with the reset in destroyRPCConnection so the invariant holds however the
+        // slot became empty, not only on the path that empties it today.
+        m_rpcRequestOrdinals[slangTestThreadIndex] = 0;
     }
 
     return m_jsonRpcConnections[slangTestThreadIndex];
@@ -313,4 +369,20 @@ SpawnType TestContext::getFinalSpawnType(SpawnType spawnType)
 SpawnType TestContext::getFinalSpawnType()
 {
     return getFinalSpawnType(options.defaultSpawnType);
+}
+
+bool TestContext::reportTestFailure()
+{
+    int count = s_consecutiveFailures.fetch_add(1) + 1;
+    if (count >= kConsecutiveFailureAbortThreshold)
+    {
+        stopSchedulingTests.store(true);
+        return true;
+    }
+    return false;
+}
+
+void TestContext::reportTestPass()
+{
+    s_consecutiveFailures.store(0);
 }

@@ -1,7 +1,6 @@
 tests/cooperative-vector/load-store-arbitrary-array-vec.slang (vk)
 tests/cooperative-vector/load-store-arbitrary-array.slang (vk)
 tests/cooperative-vector/matrix-mul-bias-structuredbuffer-packed.slang (vk)
-tests/cooperative-vector/matrix-mul-rwbyteaddress-packed.slang (vk)
 tests/cooperative-vector/matrix-mul-structuredbuffer-packed.slang (vk)
 tests/cooperative-vector/outer-product-structuredbuffer.slang (vk)
 tests/cooperative-vector/outer-product.slang (vk)

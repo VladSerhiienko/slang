@@ -1,12 +1,12 @@
 // capabilities-generator-main.cpp
 
-#include "../../source/compiler-core/slang-lexer.h"
-#include "../../source/compiler-core/slang-perfect-hash-codegen.h"
-#include "../../source/core/slang-file-system.h"
-#include "../../source/core/slang-io.h"
-#include "../../source/core/slang-secure-crt.h"
-#include "../../source/core/slang-string-util.h"
-#include "../../source/core/slang-uint-set.h"
+#include "compiler-core/slang-lexer.h"
+#include "compiler-core/slang-perfect-hash-codegen.h"
+#include "core/slang-file-system.h"
+#include "core/slang-io.h"
+#include "core/slang-secure-crt.h"
+#include "core/slang-string-util.h"
+#include "core/slang-uint-set.h"
 
 #include <stdio.h>
 
@@ -272,6 +272,9 @@ public:
                 }
                 keyAtomsFound.clear();
             }
+            // TODO: PR #4237 (ArielG-NV) - alreadySetStage is set but never read.
+            // Line 249 uses !alreadySetTarget instead of !alreadySetStage, which is likely a bug.
+            SLANG_UNUSED(alreadySetStage);
 
             // add all shared key atoms
             for (auto keyAtom : sharedKeyAtomsInCanonicalSet_target)
@@ -279,7 +282,7 @@ public:
             for (auto keyAtom : sharedKeyAtomsInCanonicalSet_stage)
                 this->keyAtomsPresent.add(keyAtom);
         }
-        if (auto base = this->getAbstractBase())
+        if (auto base = this->getAbstractBase(); base)
             keyAtomsPresent.add(this);
     }
 };
@@ -594,6 +597,8 @@ struct CapabilityDefParser
             def->sourceLoc = nameToken.loc;
         }
         validateInternalAtomExternalAtomPair();
+        if (m_sink->getErrorCount())
+            return SLANG_FAIL;
         return SLANG_OK;
     }
 };
@@ -1463,5 +1468,6 @@ int main(int argc, const char* const* argv)
         return 1;
     }
     printDiagnostics(&sink);
-    return 0;
+    // generateDefinitions can diagnose an error yet still return SLANG_OK, so consult the sink.
+    return sink.getErrorCount() ? 1 : 0;
 }

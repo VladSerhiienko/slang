@@ -26,6 +26,21 @@ bool isUserPointerType(IRInst* type)
     return ptrType->getAddressSpace() == AddressSpace::UserPointer;
 }
 
+bool isAddressInst(IRInst* inst)
+{
+    switch (inst->getOp())
+    {
+    case kIROp_FieldAddress:
+    case kIROp_GetElementPtr:
+    case kIROp_GetOffsetPtr:
+    case kIROp_RWStructuredBufferGetElementPtr:
+    case kIROp_NodeOutputRecordGetElementPtr:
+        return true;
+    default:
+        return false;
+    }
+}
+
 IRType* getVectorElementType(IRType* type)
 {
     if (auto vectorType = as<IRVectorType>(type))
@@ -75,6 +90,11 @@ bool isPointerOfType(IRInst* type, IRInst* elementType)
                isTypeEqual(ptrType->getValueType(), (IRType*)elementType);
     }
     return false;
+}
+
+bool isAnnotation(IRInst* inst)
+{
+    return as<IRAnnotation>(inst);
 }
 
 bool isPtrToClassType(IRInst* type)
@@ -177,6 +197,53 @@ IROp getTypeStyle(BaseType op)
     }
 }
 
+// Split parameter type into a direction and a type
+std::tuple<ParameterDirectionInfo, IRType*> splitParameterDirectionAndType(IRType* paramType)
+{
+    if (as<IROutParamType>(paramType))
+        return {
+            ParameterDirectionInfo(ParameterDirectionInfo::Kind::Out),
+            as<IROutParamType>(paramType)->getValueType()};
+    else if (as<IRBorrowInOutParamType>(paramType))
+        return {
+            ParameterDirectionInfo(ParameterDirectionInfo::Kind::BorrowInOut),
+            as<IRBorrowInOutParamType>(paramType)->getValueType()};
+    else if (as<IRRefParamType>(paramType))
+        return {
+            ParameterDirectionInfo(
+                ParameterDirectionInfo::Kind::Ref,
+                as<IRRefParamType>(paramType)->getAddressSpace()),
+            as<IRRefParamType>(paramType)->getValueType()};
+    else if (as<IRBorrowInParamType>(paramType))
+        return {
+            ParameterDirectionInfo(
+                ParameterDirectionInfo::Kind::BorrowIn,
+                as<IRBorrowInParamType>(paramType)->getAddressSpace()),
+            as<IRBorrowInParamType>(paramType)->getValueType()};
+    else
+        return {ParameterDirectionInfo(ParameterDirectionInfo::Kind::In), paramType};
+}
+
+// Join parameter direction and a type back into a parameter type
+IRType* fromDirectionAndType(IRBuilder* builder, ParameterDirectionInfo info, IRType* type)
+{
+    switch (info.kind)
+    {
+    case ParameterDirectionInfo::Kind::In:
+        return type;
+    case ParameterDirectionInfo::Kind::Out:
+        return builder->getOutParamType(type);
+    case ParameterDirectionInfo::Kind::BorrowInOut:
+        return builder->getBorrowInOutParamType(type);
+    case ParameterDirectionInfo::Kind::BorrowIn:
+        return builder->getBorrowInParamType(type, info.addressSpace);
+    case ParameterDirectionInfo::Kind::Ref:
+        return builder->getRefParamType(type, info.addressSpace);
+    default:
+        SLANG_UNEXPECTED("Unhandled parameter info in fromDirectionAndType");
+    }
+}
+
 IRInst* specializeWithGeneric(
     IRBuilder& builder,
     IRInst* genericToSpecialize,
@@ -246,8 +313,8 @@ bool isValueType(IRInst* dataType)
     case kIROp_TupleType:
     case kIROp_ResultType:
     case kIROp_OptionalType:
+    case kIROp_ConditionalType:
     case kIROp_DifferentialPairType:
-    case kIROp_DifferentialPairUserCodeType:
     case kIROp_DynamicType:
     case kIROp_AnyValueType:
     case kIROp_ArrayType:
@@ -255,6 +322,11 @@ bool isValueType(IRInst* dataType)
     case kIROp_RaytracingAccelerationStructureType:
     case kIROp_GLSLAtomicUintType:
     case kIROp_EnumType:
+    // Work-graph input records are immutable payload views, so treat them as values.
+    case kIROp_DispatchNodeInputRecordType:
+    case kIROp_ThreadNodeInputRecordType:
+    case kIROp_GroupNodeInputRecordsType:
+    case kIROp_EmptyNodeInputType:
         return true;
     default:
         // Read-only resource handles are considered as Value type.
@@ -346,6 +418,7 @@ bool isWrapperType(IRInst* inst)
     case kIROp_HLSLConsumeStructuredBufferType:
     case kIROp_TupleType:
     case kIROp_OptionalType:
+    case kIROp_ConditionalType:
     case kIROp_TypePack:
         return true;
     default:
@@ -404,6 +477,17 @@ IRInst* hoistValueFromGeneric(
             subOutSpecialized,
             false);
         newGeneric->setFullType((IRType*)genericFuncType);
+    }
+    else if (newResultVal->getOp() == kIROp_WitnessTable)
+    {
+        IRBuilder subBuilder = builder;
+        IRInst* subOutSpecialized = nullptr;
+        auto genericWitnessTableType = hoistValueFromGeneric(
+            subBuilder,
+            newResultVal->getFullType(),
+            subOutSpecialized,
+            false);
+        newGeneric->setFullType((IRType*)genericWitnessTableType);
     }
     else
     {
@@ -857,6 +941,7 @@ IRInst* getRootAddr(IRInst* addr)
         {
         case kIROp_GetElementPtr:
         case kIROp_FieldAddress:
+        case kIROp_NodeOutputRecordGetElementPtr:
             addr = addr->getOperand(0);
             continue;
         default:
@@ -875,6 +960,7 @@ IRInst* getRootAddr(IRInst* addr, List<IRInst*>& outAccessChain, List<IRInst*>* 
         {
         case kIROp_GetElementPtr:
         case kIROp_FieldAddress:
+        case kIROp_NodeOutputRecordGetElementPtr:
             outAccessChain.add(addr->getOperand(1));
             if (outTypes)
                 outTypes->add(addr->getFullType());
@@ -1161,6 +1247,13 @@ bool isPtrLikeOrHandleType(IRInst* type)
     case kIROp_RefParamType:
     case kIROp_BorrowInParamType:
     case kIROp_GLSLShaderStorageBufferType:
+    // Work-graph output records are mutable handles, so treat them as pointer-like.
+    case kIROp_ThreadNodeOutputRecordsType:
+    case kIROp_GroupNodeOutputRecordsType:
+    case kIROp_NodeOutputType:
+    case kIROp_NodeOutputArrayType:
+    case kIROp_EmptyNodeOutputType:
+    case kIROp_EmptyNodeOutputArrayType:
         return true;
     }
     return false;
@@ -1262,26 +1355,10 @@ bool canInstHaveSideEffectAtAddress(IRGlobalValueWithCode* func, IRInst* inst, I
     return false;
 }
 
-IRInst* getUnitPoisonVal(IRBuilder builder, IRModule* module)
+IRInst* getUnitPoisonVal(IRBuilder* builder)
 {
-    IRInst* undefInst = nullptr;
-
-    for (auto inst : module->getModuleInst()->getChildren())
-    {
-        if (inst->getOp() == kIROp_Poison && inst->getDataType() &&
-            inst->getDataType()->getOp() == kIROp_VoidType)
-        {
-            undefInst = inst;
-            break;
-        }
-    }
-    if (!undefInst)
-    {
-        auto voidType = builder.getVoidType();
-        builder.setInsertAfter(voidType);
-        undefInst = builder.emitPoison(voidType);
-    }
-    return undefInst;
+    builder->setInsertInto(builder->getModule()->getModuleInst());
+    return builder->getPoison(builder->getVoidType());
 }
 
 IROp getSwapSideComparisonOp(IROp op)
@@ -1413,6 +1490,8 @@ IRInst* tryFindBasePtr(IRInst* inst, IRInst* parentFunc)
         return tryFindBasePtr(as<IRGetElementPtr>(inst)->getBase(), parentFunc);
     case kIROp_FieldAddress:
         return tryFindBasePtr(as<IRFieldAddress>(inst)->getBase(), parentFunc);
+    case kIROp_NodeOutputRecordGetElementPtr:
+        return tryFindBasePtr(inst->getOperand(0), parentFunc);
     default:
         return nullptr;
     }
@@ -1541,7 +1620,8 @@ bool areCallArgumentsSideEffectFree(IRCall* call, SideEffectAnalysisOptions opti
         }
         else
         {
-            if (param && param->findDecoration<IRIgnoreSideEffectsDecoration>())
+            if (param && !as<IROutParamType>(param->getDataType()) &&
+                param->findDecoration<IRIgnoreSideEffectsDecoration>())
                 continue;
 
             return false;
@@ -1560,9 +1640,12 @@ bool isPureFunctionalCall(IRCall* call, SideEffectAnalysisOptions options)
     return false;
 }
 
-bool isSideEffectFreeFunctionalCall(IRCall* call, SideEffectAnalysisOptions options)
+bool isSideEffectFreeFunctionalCall(
+    IRCall* call,
+    SideEffectAnalysisOptions options,
+    Dictionary<IRInst*, bool>* calleeSideEffectCache)
 {
-    if (!doesCalleeHaveSideEffect(call->getCallee()))
+    if (!doesCalleeHaveSideEffect(call->getCallee(), calleeSideEffectCache))
     {
         return areCallArgumentsSideEffectFree(call, options);
     }
@@ -1573,74 +1656,20 @@ bool isSideEffectFreeFunctionalCall(IRCall* call, SideEffectAnalysisOptions opti
 // that might be used by a pass (e.g. auto-diff)
 //
 template<typename TFunc>
-void forEachAssociatedFunction(IRInst* func, TFunc callback)
+void forEachAssociatedCallee(IRInst* callee, TFunc callback)
 {
-    // Resolve the function to get all its decorations
-    auto resolvedFunc = getResolvedInstForDecorations(func);
-    if (!resolvedFunc)
-        return;
-
-    // We'll scan for appropriate decorations and return
-    // the function references.
-    //
-    // TODO: In the future, as we get more function transformation
-    // passes, we might want to create a parent class for such
-    // decorations that associate functions with each other.
-    //
-    for (auto decor : resolvedFunc->getDecorations())
-    {
-        switch (decor->getOp())
+    traverseUsers<IRAnnotation>(
+        callee,
+        [&](IRAnnotation* annotation)
         {
-        case kIROp_UserDefinedBackwardDerivativeDecoration:
-            if (as<IRUserDefinedBackwardDerivativeDecoration>(decor))
-            {
-                auto associatedCallee = as<IRUserDefinedBackwardDerivativeDecoration>(decor)
-                                            ->getBackwardDerivativeFunc();
-                callback(associatedCallee);
-            }
-            break;
-
-        case kIROp_ForwardDerivativeDecoration:
-            if (as<IRForwardDerivativeDecoration>(decor))
-            {
-                auto associatedCallee =
-                    as<IRForwardDerivativeDecoration>(decor)->getForwardDerivativeFunc();
-                callback(associatedCallee);
-            }
-            break;
-
-        case kIROp_PrimalSubstituteDecoration:
-            if (as<IRPrimalSubstituteDecoration>(decor))
-            {
-                auto associatedCallee =
-                    as<IRPrimalSubstituteDecoration>(decor)->getPrimalSubstituteFunc();
-                callback(associatedCallee);
-            }
-            break;
-
-        default:
-            break;
-        }
-    }
+            if (annotation->getTarget() == callee)
+                callback(annotation->getInst());
+        });
 }
 
 bool doesCalleeHaveSideEffect(IRInst* callee)
 {
-    bool sideEffect = true;
-
-    for (auto decor : getResolvedInstForDecorations(callee)->getDecorations())
-    {
-        switch (decor->getOp())
-        {
-        case kIROp_NoSideEffectDecoration:
-        case kIROp_ReadNoneDecoration:
-        case kIROp_IgnoreSideEffectsDecoration:
-            sideEffect = false;
-            break;
-        default:
-            break;
-        }
-    }
+    bool sideEffect = !isNoSideEffectCallee(callee);
 
     // If the callee has no side effect, check if any of its associated functions have side
     // effect. If so, we want to keep the callee around.
@@ -1648,17 +1677,34 @@ bool doesCalleeHaveSideEffect(IRInst* callee)
     // Typically, once the relevant pass has completed, the association is removed,
     // and at that point we can remove the function.
     //
+    // TODO: We can narrow this check down a bit.. this check is only really
+    // needed if the parent function that is performing the call is an operand
+    // of a translate inst (i.e. IRTranslateBase/IRTranslatedTypeBase)
+    //
     if (!sideEffect)
     {
-        forEachAssociatedFunction(
+        forEachAssociatedCallee(
             callee,
             [&](IRInst* associatedCallee)
             {
-                sideEffect |= doesCalleeHaveSideEffect(associatedCallee);
+                sideEffect |= !isNoSideEffectCallee(associatedCallee);
                 return;
             });
     }
 
+    return sideEffect;
+}
+
+bool doesCalleeHaveSideEffect(IRInst* callee, Dictionary<IRInst*, bool>* cache)
+{
+    if (!cache)
+        return doesCalleeHaveSideEffect(callee);
+
+    if (auto cached = cache->tryGetValue(callee))
+        return *cached;
+
+    const bool sideEffect = doesCalleeHaveSideEffect(callee);
+    cache->add(callee, sideEffect);
     return sideEffect;
 }
 
@@ -1677,6 +1723,12 @@ IRInst* findInterfaceRequirement(IRInterfaceType* type, IRInst* key)
 
 IRInst* findWitnessTableEntry(IRWitnessTable* table, IRInst* key)
 {
+    if (table->getConformanceType()->getOp() == kIROp_VoidType)
+    {
+        IRBuilder builder(table->getModule());
+        return builder.getVoidValue();
+    }
+
     for (auto entry : table->getEntries())
     {
         if (entry->getRequirementKey() == key)
@@ -1709,7 +1761,7 @@ IRInst* getInstInBlock(IRInst* inst)
 {
     SLANG_RELEASE_ASSERT(inst);
 
-    if (const auto block = as<IRBlock>(inst->getParent()))
+    if (const auto block = as<IRBlock>(inst->getParent()); block)
         return inst;
 
     return getInstInBlock(inst->getParent());
@@ -1917,19 +1969,6 @@ void initializeScratchData(IRInst* inst)
     }
 }
 
-void resetScratchDataBit(IRInst* inst, int bitIndex)
-{
-    List<IRInst*> workList;
-    workList.add(inst);
-    while (workList.getCount() != 0)
-    {
-        auto item = workList.getLast();
-        workList.removeLast();
-        item->scratchData &= ~(1ULL << bitIndex);
-        for (auto child = item->getLastDecorationOrChild(); child; child = child->getPrevInst())
-            workList.add(child);
-    }
-}
 
 ///
 /// IRBlock related common helper methods
@@ -2144,6 +2183,12 @@ UnownedStringSlice getBuiltinFuncName(IRInst* callee)
         return UnownedStringSlice::fromLiteral("IDifferentiable");
     case KnownBuiltinDeclName::IDifferentiablePtr:
         return UnownedStringSlice::fromLiteral("IDifferentiablePtr");
+    case KnownBuiltinDeclName::IForwardDifferentiable:
+        return UnownedStringSlice::fromLiteral("IForwardDifferentiable");
+    case KnownBuiltinDeclName::IBackwardDifferentiable:
+        return UnownedStringSlice::fromLiteral("IBackwardDifferentiable");
+    case KnownBuiltinDeclName::IBwdCallable:
+        return UnownedStringSlice::fromLiteral("IBwdCallable");
     case KnownBuiltinDeclName::NullDifferential:
         return UnownedStringSlice::fromLiteral("NullDifferential");
     default:
@@ -2395,6 +2440,24 @@ IRType* dropNormAttributes(IRType* const t)
     return t;
 }
 
+/// Gets a literal thread count, unwrapping a specialization constant's default when needed.
+static IRIntLit* _getDefaultThreadCount(IRInst* threadCount)
+{
+    if (auto intLit = as<IRIntLit>(threadCount))
+        return intLit;
+
+    auto globalParam = as<IRGlobalParam>(threadCount);
+    auto defaultValueDecor =
+        globalParam ? globalParam->findDecoration<IRDefaultValueDecoration>() : nullptr;
+    if (defaultValueDecor)
+        if (auto defaultIntLit = as<IRIntLit>(defaultValueDecor->getOperand(0)))
+            return defaultIntLit;
+
+    IRBuilder builder(globalParam ? (IRInst*)globalParam : threadCount);
+    return cast<IRIntLit>(
+        builder.getIntValue(globalParam ? globalParam->getDataType() : builder.getIntType(), 1));
+}
+
 void verifyComputeDerivativeGroupModifiers(
     DiagnosticSink* sink,
     SourceLoc errorLoc,
@@ -2411,15 +2474,9 @@ void verifyComputeDerivativeGroupModifiers(
             Diagnostics::OnlyOneOfDerivativeGroupLinearOrQuadCanBeSet{.location = errorLoc});
     }
 
-    IRIntegerValue x = 1;
-    IRIntegerValue y = 1;
-    IRIntegerValue z = 1;
-    if (numThreadsDecor->getX())
-        x = numThreadsDecor->getX()->getValue();
-    if (numThreadsDecor->getY())
-        y = numThreadsDecor->getY()->getValue();
-    if (numThreadsDecor->getZ())
-        z = numThreadsDecor->getZ()->getValue();
+    IRIntegerValue x = _getDefaultThreadCount(numThreadsDecor->getOperand(0))->getValue();
+    IRIntegerValue y = _getDefaultThreadCount(numThreadsDecor->getOperand(1))->getValue();
+    IRIntegerValue z = _getDefaultThreadCount(numThreadsDecor->getOperand(2))->getValue();
 
     if (quadAttr)
     {
@@ -2458,6 +2515,10 @@ IRType* getElementType(IRBuilder& builder, IRType* valueType)
     else if (auto vectorType = as<IRVectorType>(valueType))
     {
         return vectorType->getElementType();
+    }
+    else if (auto packedVectorType = as<IRMetalPackedVectorType>(valueType))
+    {
+        return packedVectorType->getElementType();
     }
     else if (auto basicType = as<IRBasicType>(valueType))
     {
@@ -2557,8 +2618,8 @@ bool canInstBeStored(IRInst* inst)
     // stored into variables or context structs as normal values.
     //
     if (as<IRTypeType>(inst->getDataType()) || as<IRWitnessTableType>(inst->getDataType()) ||
-        as<IRTypeKind>(inst->getDataType()) || as<IRFuncType>(inst->getDataType()) ||
-        !inst->getDataType())
+        as<IRTypeKind>(inst->getDataType()) || as<IRGenericKind>(inst->getDataType()) ||
+        as<IRFuncType>(inst->getDataType()) || !inst->getDataType())
         return false;
 
     return true;
@@ -2667,7 +2728,6 @@ void legalizeDefUse(IRGlobalValueWithCode* func, TargetProgram* target)
                 // instead of before the `if`. This situation can occur in the IR if
                 // the original code is lowered from a `do-while` loop.
                 //
-                bool shouldInitializeVar = false;
                 if (loopHeaderBlockMap.containsKey(commonDominator))
                 {
                     bool shouldMoveToHeader = false;
@@ -2688,7 +2748,6 @@ void legalizeDefUse(IRGlobalValueWithCode* func, TargetProgram* target)
                     if (shouldMoveToHeader)
                     {
                         commonDominator = loopHeaderBlockMap[commonDominator];
-                        shouldInitializeVar = true;
                     }
                 }
 
@@ -2699,16 +2758,6 @@ void legalizeDefUse(IRGlobalValueWithCode* func, TargetProgram* target)
                     // common dominator.
                     if (var->getParent() != commonDominator)
                         var->insertBefore(commonDominator->getTerminator());
-
-                    if (shouldInitializeVar)
-                    {
-                        IRBuilder builder(func);
-                        builder.setInsertAfter(var);
-                        builder.emitStore(
-                            var,
-                            builder.emitDefaultConstruct(
-                                as<IRPtrTypeBase>(var->getDataType())->getValueType()));
-                    }
                 }
                 else if (shouldDuplicateInstAtUseSite(inst, target))
                 {
@@ -2754,8 +2803,6 @@ void legalizeDefUse(IRGlobalValueWithCode* func, TargetProgram* target)
                     IRBuilder builder(func);
                     builder.setInsertBefore(commonDominator->getTerminator());
                     IRVar* tempVar = builder.emitVar(inst->getFullType());
-                    auto defaultVal = builder.emitDefaultConstruct(inst->getFullType());
-                    builder.emitStore(tempVar, defaultVal);
 
                     traverseUses(
                         inst,
@@ -2828,6 +2875,27 @@ IRType* maybeAddRateType(IRBuilder* builder, IRType* rateQulifiedType, IRType* o
     return oldType;
 }
 
+// Ensures `type` carries a SpecConst rate.
+// If the type already has a different rate (e.g. ConstExpr from a `static const`
+// expression whose operands are specialization constants), the existing rate is
+// replaced, as a value that depends on a spec-const is only known at pipeline
+// creation time, so `ConstExpr` (compile-time) would be incorrect.
+//
+IRType* ensureSpecConstRate(IRBuilder* builder, IRType* type)
+{
+    if (isSpecConstRateType(type))
+        return type;
+
+    // Strip any existing rate (e.g. ConstExpr) to avoid double-wrapping,
+    // since getRateQualifiedType does not unwrap for us.
+    if (auto rateQualified = as<IRRateQualifiedType>(type))
+        return builder->getRateQualifiedType(
+            builder->getSpecConstRate(),
+            rateQualified->getValueType());
+
+    return builder->getRateQualifiedType(builder->getSpecConstRate(), type);
+}
+
 bool canOperationBeSpecConst(IROp op, IRType* resultType, IRInst* const* fixedArgs, IRUse* operands)
 {
     // Returns true for ops that can be declared as an operation under `OpSpecConstantOp`.
@@ -2888,18 +2956,44 @@ bool canOperationBeSpecConst(IROp op, IRType* resultType, IRInst* const* fixedAr
     }
 }
 
-bool isSpecConstOpHoistable(IROp op, IRType* type, IRInst* const* fixedArgs)
+bool shouldHaveSpecConstRate(
+    IROp op,
+    IRType* resultType,
+    UInt operandCount,
+    IRInst* const* operands)
 {
-    auto rateType = as<IRRateQualifiedType>(type);
-    return rateType && as<IRSpecConstRate>(rateType->getRate()) &&
-           canOperationBeSpecConst(op, rateType->getValueType(), fixedArgs, nullptr);
+    if (operandCount == 0)
+        return false;
+
+    // Unwrap any rate qualification so canOperationBeSpecConst sees the bare
+    // value type. isFloatingType checks as<IRBasicType> which doesn't match
+    // rate-qualified types like @ConstExpr float, so without unwrapping we
+    // would incorrectly allow float arithmetic as `OpSpecConstantOp`.
+    IRType* valueType = resultType;
+    if (auto rateQualifiedType = as<IRRateQualifiedType>(resultType))
+        valueType = rateQualifiedType->getValueType();
+
+    if (!canOperationBeSpecConst(op, valueType, operands, nullptr))
+        return false;
+
+    // An instruction whose result carries a spec-const rate is hoisted and
+    // emitted as OpSpecConstantOp for SPIR-V. That is only valid when
+    // every operand is itself a specialization constant or a plain
+    // constant. Mixing in a runtime value would produce invalid SPIR-V.
+    bool hasSpecConstOperand = false;
+    for (UInt ii = 0; ii < operandCount; ++ii)
+    {
+        if (isSpecConstRateType(operands[ii]->getFullType()))
+            hasSpecConstOperand = true;
+        else if (!as<IRConstant>(operands[ii]))
+            return false;
+    }
+    return hasSpecConstOperand;
 }
 
-
-bool isInstHoistable(IROp op, IRType* type, IRInst* const* fixedArgs)
+bool isInstHoistable(IROp op)
 {
-    return (getIROpInfo(op).flags & kIROpFlag_Hoistable) ||
-           isSpecConstOpHoistable(op, type, fixedArgs);
+    return (getIROpInfo(op).flags & kIROpFlag_Hoistable);
 }
 
 IRType* getUnsignedTypeFromSignedType(IRBuilder* builder, IRType* type)
@@ -2983,8 +3077,39 @@ bool isIROpaqueType(IRType* type)
     }
 }
 
+// True if `addr`'s chain bottoms out at `GetOptiXSbtDataPtr` (the OptiX SBT), peeling every
+// forwarding op, including the `BitCast`/`GetOffsetPtr` that `getRootAddr` does not peel.
+static bool isAddressIntoOptiXShaderBindingTable(IRInst* addr)
+{
+    for (;;)
+    {
+        switch (addr->getOp())
+        {
+        case kIROp_GetOptiXSbtDataPtr:
+            return true;
+        case kIROp_FieldAddress:
+        case kIROp_GetElementPtr:
+        case kIROp_GetOffsetPtr:
+        case kIROp_BitCast:
+        case kIROp_Reinterpret:
+        case kIROp_PtrCast:
+            addr = addr->getOperand(0);
+            continue;
+        default:
+            return false;
+        }
+    }
+}
+
 bool isPointerToImmutableLocation(IRInst* loc)
 {
+    // The OptiX SBT (`GetOptiXSbtDataPtr`) is typed as a `ConstantBuffer<>` but is mutated
+    // in place by the host between dispatches, so it is not immutable; otherwise CUDA emit
+    // would route its loads through the read-only cache (`__ldg`) and read stale data.
+    // Genuine `ConstantBuffer<>` (not SBT-rooted) is unaffected. See shader-slang/slang#10188.
+    if (isAddressIntoOptiXShaderBindingTable(loc))
+        return false;
+
     switch (loc->getOp())
     {
     case kIROp_GetStructuredBufferPtr:
@@ -3095,6 +3220,204 @@ IRType* getSamplerTypeFromCombinedTextureSampler(IRType* type)
         return builder.getType(kIROp_SamplerComparisonStateType);
     else
         return builder.getType(kIROp_SamplerStateType);
+}
+
+IRInst* getInnerMostGenericReturnVal(IRGeneric* generic)
+{
+    auto returnVal = findGenericReturnVal(generic);
+    if (auto innerGeneric = as<IRGeneric>(returnVal))
+        return getInnerMostGenericReturnVal(innerGeneric);
+    return returnVal;
+}
+
+bool isReadNoneCallee(IRInst* callee)
+{
+    if (auto func = as<IRFunc>(callee))
+    {
+        if (func->findDecoration<IRReadNoneDecoration>())
+            return true;
+    }
+
+    if (as<IRSpecialize>(callee))
+    {
+        if (auto specialize = as<IRSpecialize>(callee->getOperand(0)))
+        {
+            return isReadNoneCallee(specialize);
+        }
+        else if (auto generic = as<IRGeneric>(callee->getOperand(0)))
+        {
+            auto genericReturnVal = getInnerMostGenericReturnVal(generic);
+
+            if (genericReturnVal)
+                return isReadNoneCallee(genericReturnVal);
+            else
+                return false;
+        }
+    }
+
+    if (as<IRTranslateBase>(callee))
+    {
+        switch (callee->getOp())
+        {
+        // Translations that have the same readNone property as the original function.
+        case kIROp_BackwardDifferentiatePrimal:
+        case kIROp_BackwardPrimalFromLegacyBwdDiffFunc:
+        case kIROp_ForwardDifferentiate:
+        case kIROp_TrivialForwardDifferentiate:
+        case kIROp_TrivialBackwardDifferentiatePrimal:
+        case kIROp_FunctionCopy:
+            return isReadNoneCallee(callee->getOperand(0));
+
+        case kIROp_BackwardPropagateFromLegacyBwdDiffFunc:
+            return isReadNoneCallee(callee->getOperand(1));
+
+        // Translations that produce a readNone function even if the original function
+        // is not readNone.
+        case kIROp_BackwardRemat:
+        case kIROp_BackwardRematFromLegacyBwdDiffFunc:
+        case kIROp_TrivialBackwardDifferentiatePropagate:
+        case kIROp_TrivialBackwardRemat:
+            return true;
+        }
+    }
+
+    // Default: cannot assume that unknown op-codes are read-none
+    return false;
+}
+
+
+bool isNoSideEffectCallee(IRInst* callee)
+{
+    if (auto func = as<IRFunc>(callee))
+    {
+        if (func->findDecoration<IRNoSideEffectDecoration>() ||
+            func->findDecoration<IRReadNoneDecoration>())
+            return true;
+    }
+
+    if (as<IRSpecialize>(callee))
+    {
+        if (auto specialize = as<IRSpecialize>(callee->getOperand(0)))
+        {
+            return isNoSideEffectCallee(specialize);
+        }
+        else if (auto generic = as<IRGeneric>(callee->getOperand(0)))
+        {
+            auto genericReturnVal = getInnerMostGenericReturnVal(generic);
+
+            if (genericReturnVal)
+                return isNoSideEffectCallee(genericReturnVal);
+            else
+                return false;
+        }
+    }
+
+    if (as<IRTranslateBase>(callee))
+    {
+        switch (callee->getOp())
+        {
+        // Translations that have the same noSideEffect property as the original function.
+        case kIROp_BackwardDifferentiatePrimal:
+        case kIROp_BackwardPrimalFromLegacyBwdDiffFunc:
+        case kIROp_ForwardDifferentiate:
+        case kIROp_TrivialForwardDifferentiate:
+        case kIROp_TrivialBackwardDifferentiatePrimal:
+        case kIROp_FunctionCopy:
+            return isNoSideEffectCallee(callee->getOperand(0));
+
+        case kIROp_BackwardPropagateFromLegacyBwdDiffFunc:
+            return isNoSideEffectCallee(callee->getOperand(1));
+
+        // Translations that produce a noSideEffect function even if the original function
+        // is not noSideEffect.
+        case kIROp_BackwardRemat:
+        case kIROp_BackwardRematFromLegacyBwdDiffFunc:
+        case kIROp_TrivialBackwardDifferentiatePropagate:
+        case kIROp_TrivialBackwardRemat:
+            return true;
+        }
+    }
+
+    // Default: cannot assume that unknown op-codes are read-none
+    return false;
+}
+
+bool tryGetConstantIntLit(IRInst* inst, Int64& outValue)
+{
+    if (auto intLit = as<IRIntLit>(inst))
+    {
+        outValue = intLit->getValue();
+        return true;
+    }
+    return false;
+}
+
+bool areKnownEqualShapeElements(IRInst* left, IRInst* right)
+{
+    if (left == right)
+        return true;
+
+    auto leftInt = as<IRIntLit>(left);
+    auto rightInt = as<IRIntLit>(right);
+    return leftInt && rightInt && leftInt->getValue() == rightInt->getValue();
+}
+
+IRInst* emitPackLike(IRModule* module, IRInst* oldInst, ArrayView<IRInst*> elements)
+{
+    auto resultType = as<IRType>(oldInst->getDataType());
+    if (!resultType)
+        return nullptr;
+
+    IRBuilder builder(module);
+    IRBuilderSourceLocRAII srcLocRAII(&builder, oldInst->sourceLoc);
+    builder.setInsertBefore(oldInst);
+
+    if (resultType->getOp() == kIROp_TupleType)
+        return builder.emitMakeTuple(resultType, elements.getCount(), elements.getBuffer());
+
+    return builder.emitMakeValuePack(resultType, elements.getCount(), elements.getBuffer());
+}
+
+bool isWorkGraphRecordType(IRType* type)
+{
+    SLANG_ASSERT(type);
+    switch (type->getOp())
+    {
+    case kIROp_DispatchNodeInputRecordType:
+    case kIROp_ThreadNodeInputRecordType:
+    case kIROp_GroupNodeInputRecordsType:
+    case kIROp_EmptyNodeInputType:
+    case kIROp_ThreadNodeOutputRecordsType:
+    case kIROp_GroupNodeOutputRecordsType:
+    case kIROp_NodeOutputType:
+    case kIROp_NodeOutputArrayType:
+    case kIROp_EmptyNodeOutputType:
+    case kIROp_EmptyNodeOutputArrayType:
+        return true;
+    default:
+        return false;
+    }
+}
+
+IRType* getWorkGraphRecordElementType(IRType* type)
+{
+    SLANG_ASSERT(type);
+
+    switch (type->getOp())
+    {
+    case kIROp_DispatchNodeInputRecordType:
+    case kIROp_ThreadNodeInputRecordType:
+    case kIROp_GroupNodeInputRecordsType:
+    case kIROp_ThreadNodeOutputRecordsType:
+    case kIROp_GroupNodeOutputRecordsType:
+    case kIROp_NodeOutputType:
+    case kIROp_NodeOutputArrayType:
+        return as<IRType>(type->getOperand(0));
+    default:
+        break;
+    }
+
+    return nullptr;
 }
 
 } // namespace Slang

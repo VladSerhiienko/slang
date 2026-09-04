@@ -31,7 +31,10 @@ bool DeviceCache::DeviceCacheKey::operator==(const DeviceCacheKey& other) const
 {
     return deviceType == other.deviceType && enableValidation == other.enableValidation &&
            enableRayTracingValidation == other.enableRayTracingValidation &&
-           profileName == other.profileName && requiredFeatures == other.requiredFeatures;
+           profileName == other.profileName && targetFlags == other.targetFlags &&
+           defaultMatrixLayoutMode == other.defaultMatrixLayoutMode &&
+           nvapiExtUavSlot == other.nvapiExtUavSlot &&
+           dx12ExperimentalFeatures == other.dx12ExperimentalFeatures;
 }
 
 std::size_t DeviceCache::DeviceCacheKeyHash::operator()(const DeviceCacheKey& key) const
@@ -40,14 +43,12 @@ std::size_t DeviceCache::DeviceCacheKeyHash::operator()(const DeviceCacheKey& ke
     std::size_t h2 = std::hash<bool>{}(key.enableValidation);
     std::size_t h3 = std::hash<bool>{}(key.enableRayTracingValidation);
     std::size_t h4 = std::hash<std::string>{}(key.profileName);
+    std::size_t h5 = std::hash<unsigned int>{}(static_cast<unsigned int>(key.targetFlags));
+    std::size_t h6 = std::hash<int>{}(static_cast<int>(key.defaultMatrixLayoutMode));
+    std::size_t h7 = std::hash<uint32_t>{}(key.nvapiExtUavSlot);
+    std::size_t h8 = std::hash<bool>{}(key.dx12ExperimentalFeatures);
 
-    std::size_t h5 = 0;
-    for (const auto& feature : key.requiredFeatures)
-    {
-        h5 ^= std::hash<std::string>{}(feature) + 0x9e3779b9 + (h5 << 6) + (h5 >> 2);
-    }
-
-    return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
+    return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7);
 }
 
 DeviceCache::CachedDevice::CachedDevice()
@@ -81,17 +82,28 @@ void DeviceCache::evictOldestDeviceIfNeeded()
     }
 }
 
-SlangResult DeviceCache::acquireDevice(const rhi::DeviceDesc& desc, rhi::IDevice** outDevice)
+SlangResult DeviceCache::acquireDevice(
+    const rhi::DeviceDesc& desc,
+    rhi::IDevice** outDevice,
+    Slang::RefPtr<renderer_test::CoreToRHIDebugBridge>* outBridge)
 {
-    if (!outDevice)
+    if (!outDevice || !outBridge)
         return SLANG_E_INVALID_ARG;
 
     *outDevice = nullptr;
+    *outBridge = nullptr;
 
-    // Skip caching for CUDA devices due to crashes
+    // CUDA is not cached (crashes); each call gets a fresh device wired to a fresh bridge.
     if (desc.deviceType == rhi::DeviceType::CUDA)
     {
-        return rhi::getRHI()->createDevice(desc, outDevice);
+        Slang::RefPtr<renderer_test::CoreToRHIDebugBridge> bridge =
+            renderer_test::createRetainedCoreToRHIDebugBridge();
+        rhi::DeviceDesc localDesc = desc;
+        localDesc.debugCallback = bridge.Ptr();
+        SlangResult result = rhi::getRHI()->createDevice(localDesc, outDevice);
+        if (SLANG_SUCCEEDED(result))
+            *outBridge = bridge;
+        return result;
     }
 
     std::lock_guard<std::mutex> lock(getMutex());
@@ -104,41 +116,44 @@ SlangResult DeviceCache::acquireDevice(const rhi::DeviceDesc& desc, rhi::IDevice
     key.enableValidation = desc.enableValidation;
     key.enableRayTracingValidation = desc.enableRayTracingValidation;
     key.profileName = desc.slang.targetProfile ? desc.slang.targetProfile : "Unknown";
-
-    // Add required features to key
-    for (int i = 0; i < desc.requiredFeatureCount; ++i)
-    {
-        key.requiredFeatures.push_back(desc.requiredFeatures[i]);
-    }
-    std::sort(key.requiredFeatures.begin(), key.requiredFeatures.end());
+    key.targetFlags = desc.slang.targetFlags;
+    key.defaultMatrixLayoutMode = desc.slang.defaultMatrixLayoutMode;
+    key.nvapiExtUavSlot = desc.nvapiExtUavSlot;
+    key.dx12ExperimentalFeatures = (desc.next != nullptr);
 
     // Evict oldest device if we've reached the limit
     evictOldestDeviceIfNeeded();
 
     // Check if we have a cached device
     auto it = deviceCache.find(key);
-    if (it != deviceCache.end())
+    if (it != deviceCache.end() && it->second.device)
     {
-        // Return the cached device - COM reference counting handles the references
+        // Hit: return the cached device and the bridge it was created with (stored together).
+        SLANG_ASSERT(it->second.bridge);
         *outDevice = it->second.device.get();
-        if (*outDevice)
-        {
-            (*outDevice)->addRef();
-            return SLANG_OK;
-        }
+        (*outDevice)->addRef();
+        *outBridge = it->second.bridge;
+        return SLANG_OK;
     }
 
-    // Create new device
+    // Miss: create the device wired to a fresh retained bridge, and cache them together so a later
+    // hit returns the same bridge.
+    Slang::RefPtr<renderer_test::CoreToRHIDebugBridge> bridge =
+        renderer_test::createRetainedCoreToRHIDebugBridge();
+    rhi::DeviceDesc localDesc = desc;
+    localDesc.debugCallback = bridge.Ptr();
+
     Slang::ComPtr<rhi::IDevice> device;
-    auto result = rhi::getRHI()->createDevice(desc, device.writeRef());
+    SlangResult result = rhi::getRHI()->createDevice(localDesc, device.writeRef());
     if (SLANG_FAILED(result))
     {
         return result;
     }
 
-    // Cache the device
+    // Cache the device together with the bridge it was created with.
     CachedDevice& cached = deviceCache[key];
     cached.device = device;
+    cached.bridge = bridge;
     cached.creationOrder = nextCreationOrder++;
 
     // Return the device with proper reference counting
@@ -147,6 +162,7 @@ SlangResult DeviceCache::acquireDevice(const rhi::DeviceDesc& desc, rhi::IDevice
     {
         (*outDevice)->addRef();
     }
+    *outBridge = bridge;
 
     return SLANG_OK;
 }
@@ -155,6 +171,7 @@ SlangResult DeviceCache::acquireDevice(const rhi::DeviceDesc& desc, rhi::IDevice
 void DeviceCache::cleanCache()
 {
     std::lock_guard<std::mutex> lock(getMutex());
-    auto& deviceCache = getDeviceCache();
-    deviceCache.clear();
+    // Bridges stay alive via the process-global retained list, so a late message from a released
+    // device still hits a live (cleared) bridge, not freed storage.
+    getDeviceCache().clear();
 }

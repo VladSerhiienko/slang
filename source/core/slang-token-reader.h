@@ -20,6 +20,7 @@ enum class TokenType
     // constant
     IntLiteral,
     DoubleLiteral,
+    HalfLiteral,
     StringLiteral,
     CharLiteral,
     // operators
@@ -138,7 +139,7 @@ public:
     }
 };
 
-class TextFormatException : public Exception
+class SLANG_EXCEPTION_TYPE_VISIBLE TextFormatException : public Exception
 {
 public:
     TextFormatException(String message)

@@ -1,16 +1,12 @@
 // main.cpp
 
+#include "core/slang-io.h"
+#include "core/slang-test-tool-util.h"
 #include "slang.h"
-
-SLANG_API void spSetCommandLineCompilerMode(SlangCompileRequest* request);
-
-#include "../core/slang-io.h"
-#include "../core/slang-test-tool-util.h"
-#include "../slang/slang-internal.h"
+#include "slang/slang-internal.h"
 
 using namespace Slang;
 
-#include <assert.h>
 
 #ifdef _WIN32
 #define MAIN slangc_main
@@ -128,6 +124,11 @@ int wmain(int argc, wchar_t** argv)
 {
     int result = 0;
 
+#if SLANG_IGNORE_ABORT_MSG && defined(_MSC_VER)
+    // Suppress the modal abort() dialog in unattended/LLM-driven builds.
+    _set_abort_behavior(0, _WRITE_ABORT_MSG);
+#endif
+
     {
         // Convert the wide-character Unicode arguments to UTF-8,
         // since that is what Slang expects on the API side.
@@ -135,15 +136,17 @@ int wmain(int argc, wchar_t** argv)
         List<String> args;
         for (int ii = 0; ii < argc; ++ii)
         {
-            args.add(String::fromWString(argv[ii]));
-        }
-        List<char const*> argBuffers;
-        for (int ii = 0; ii < argc; ++ii)
-        {
-            argBuffers.add(args[ii].getBuffer());
+            String arg = String::fromWString(argv[ii]);
+            args.add(arg);
         }
 
-        result = MAIN(argc, (char**)&argBuffers[0]);
+        // argBuffers holds raw pointers into the String buffers owned by args.
+        // args must outlive argBuffers.
+        List<char const*> argBuffers;
+        for (const auto& arg : args)
+            argBuffers.add(arg.getBuffer());
+
+        result = MAIN((int)argBuffers.getCount(), (char**)&argBuffers[0]);
     }
 
 #ifdef _MSC_VER
@@ -159,7 +162,6 @@ int wmain(int argc, wchar_t** argv)
 
     int memleakDetected = _CrtDumpMemoryLeaks();
     SLANG_UNUSED(memleakDetected);
-
     // TODO(vserhiienko): Breaks here in the debug mode, commented out for now.
     // assert(!memleakDetected);
 #endif

@@ -13,10 +13,10 @@
 // own header: `slang-end-to-end-request.h`.
 //
 
-#include "../compiler-core/slang-artifact.h"
-#include "../compiler-core/slang-source-loc.h"
-#include "../core/slang-smart-pointer.h"
-#include "../core/slang-std-writers.h"
+#include "compiler-core/slang-artifact.h"
+#include "compiler-core/slang-source-loc.h"
+#include "core/slang-smart-pointer.h"
+#include "core/slang-std-writers.h"
 #include "slang-compiler-fwd.h"
 #include "slang-diagnostics.h"
 #include "slang-module.h"
@@ -358,5 +358,34 @@ protected:
         }
     }
 };
+
+class Scope;
+class ContainerDecl;
+
+struct PreprocessedSegment
+{
+    TokenList tokens;
+    SourceLanguage sourceLanguage;
+};
+
+List<SourceFile*> extractSourceSegments(SourceFile* sourceFile, SourceManager* sourceManager);
+
+List<PreprocessedSegment> preprocessSourceSegments(
+    List<SourceFile*> const& segments,
+    SourceLanguage defaultSourceLanguage,
+    SlangLanguageVersion& ioLanguageVersion,
+    DiagnosticSink* sink,
+    IncludeSystem* includeSystem,
+    Dictionary<String, String> const& preprocessorDefinitions,
+    Linkage* linkage,
+    PreprocessorHandler* preprocessorHandler);
+
+void parsePreprocessedSegments(
+    List<PreprocessedSegment> const& segments,
+    ASTBuilder* astBuilder,
+    TranslationUnitRequest* translationUnit,
+    DiagnosticSink* sink,
+    Scope* outerScope,
+    ContainerDecl* parentDecl);
 
 } // namespace Slang

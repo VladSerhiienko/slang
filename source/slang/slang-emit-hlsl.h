@@ -22,6 +22,7 @@ public:
     HLSLSourceEmitter(const Desc& desc)
         : Super(desc), m_extensionTracker(new HLSLExtensionTracker)
     {
+        m_sm610OrAbove = m_effectiveProfile.getVersion() > ProfileVersion::DX_6_9;
     }
 
     virtual RefObject* getExtensionTracker() SLANG_OVERRIDE { return m_extensionTracker; }
@@ -40,6 +41,7 @@ protected:
 
     // Allow caching of capability results for easier lookup.
     Dictionary<CapabilityAtom, bool> m_capabilityCache{};
+    bool m_sm610OrAbove = false;
 
     virtual void emitLayoutSemanticsImpl(
         IRInst* inst,
@@ -81,6 +83,21 @@ protected:
     virtual bool tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOuterPrec) SLANG_OVERRIDE;
     virtual bool tryEmitInstStmtImpl(IRInst* inst) SLANG_OVERRIDE;
     virtual void emitSimpleValueImpl(IRInst* inst) SLANG_OVERRIDE;
+    virtual bool shouldFoldInstIntoUseSites(IRInst* inst) SLANG_OVERRIDE;
+
+    void emitMappedCoopVecComponentType(
+        IRInst* operand,
+        IRInst* inputInterpretationPackingFactor = nullptr);
+    void emitWorkGraphRecordType(IRType* type);
+    /// Emits a parenthesized HLSL BarrierMemoryTypeFlags expression for a validated enum value.
+    void emitNamedMemoryTypeFlagSet(uint32_t flagVal);
+    /// Emits a parenthesized HLSL BarrierSemanticFlags expression for a validated enum value.
+    void emitNamedSemanticFlagSet(uint32_t flagVal);
+    void emitMatrixLayoutEnum_sm609(IRInst* operand);
+    void emitMatrixLayoutEnum_sm610(IRInst* memoryLayout, bool isTranspose);
+    void emitCoopVecMatMulBufferType(IRInst* bufferPtrInst);
+    void ensureCoopVecHlslPreludeForProfile();
+
     virtual void emitLoopControlDecorationImpl(IRLoopControlDecoration* decl) SLANG_OVERRIDE;
     virtual void emitFuncDecorationImpl(IRDecoration* decoration) SLANG_OVERRIDE;
     virtual void emitFuncDecorationsImpl(IRFunc* func) SLANG_OVERRIDE;
@@ -136,7 +153,31 @@ protected:
     void _emitHLSLDecorationSingleInt(const char* name, IRFunc* entryPoint, IRIntLit* val);
     void _emitHLSLDecorationSingleFloat(const char* name, IRFunc* entryPoint, IRFloatLit* val);
 
+    bool _shouldEmitPayloadAccessQualifiers();
     void _emitStageAccessSemantic(IRStageAccessDecoration* decoration, const char* name);
+
+    // HLSL prelude strings for built-in helper functions injected at the top of emitted output.
+    static const char* m_BuiltinPrelude64BitCast;
+    static const char* m_CoopMatPrelude;
+    static const char* m_CoopVecPrelude_sm610;
+    static const char* m_CoopVecPrelude_sm609;
+
+    // Helpers for emitting dx::linalg type names for cooperative matrix operations (SM6.10).
+    static const char* getCoopMatComponentTypeName(
+        IROp elementTypeOp,
+        DiagnosticSink* sink,
+        SourceLoc loc);
+    static const char* getCoopMatMatrixUseName(IRIntegerValue useVal);
+    static const char* getCoopMatMatrixScopeName(
+        IRIntegerValue scopeVal,
+        DiagnosticSink* sink,
+        SourceLoc loc);
+    static UnownedStringSlice getCoopVecComponentType_enum(
+        SlangScalarType slangValue,
+        IRIntegerValue inputInterpretationPackingFactor,
+        bool sm610OrAbove);
+
+    static UnownedStringSlice getInterpolationModifier_keyword(IRInterpolationMode mode);
 };
 
 } // namespace Slang

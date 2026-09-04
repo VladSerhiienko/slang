@@ -139,6 +139,8 @@ Stage getStageFromAtom(CapabilityAtom atom)
         return Stage::Callable;
     case CapabilityAtom::dispatch:
         return Stage::Dispatch;
+    case CapabilityAtom::_node:
+        return Stage::Node;
     default:
         SLANG_UNEXPECTED("unknown stage atom");
         UNREACHABLE_RETURN(Stage::Unknown);
@@ -182,6 +184,8 @@ CapabilityAtom getAtomFromStage(Stage stage)
         return CapabilityAtom::_callable;
     case Stage::Dispatch:
         return CapabilityAtom::dispatch;
+    case Stage::Node:
+        return CapabilityAtom::_node;
     default:
         SLANG_UNEXPECTED("unknown stage");
         UNREACHABLE_RETURN(CapabilityAtom::Invalid);
@@ -319,6 +323,7 @@ String getHLSLProfileName(Profile profile)
         CASE(DX_6_7, _6_7);
         CASE(DX_6_8, _6_8);
         CASE(DX_6_9, _6_9);
+        CASE(DX_6_10, _6_10);
 #undef CASE
 
     default:

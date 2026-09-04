@@ -1,9 +1,10 @@
 // slang-emit-c-like.cpp
 #include "slang-emit-c-like.h"
 
-#include "../compiler-core/slang-name.h"
-#include "../core/slang-stable-hash.h"
-#include "../core/slang-writer.h"
+#include "compiler-core/slang-name.h"
+#include "core/slang-char-util.h"
+#include "core/slang-stable-hash.h"
+#include "core/slang-writer.h"
 #include "slang-emit-source-writer.h"
 #include "slang-intrinsic-expand.h"
 #include "slang-ir-bind-existentials.h"
@@ -20,14 +21,12 @@
 #include "slang-legalize-types.h"
 #include "slang-lower-to-ir.h"
 #include "slang-mangle.h"
-#include "slang-mangled-lexer.h"
 #include "slang-rich-diagnostics.h"
 #include "slang-syntax.h"
 #include "slang-type-layout.h"
 #include "slang-visitor.h"
 #include "slang/slang-ir.h"
 
-#include <assert.h>
 
 namespace Slang
 {
@@ -457,6 +456,13 @@ void CLikeSourceEmitter::_emitType(IRType* type, DeclaratorInfo* declarator)
                     declarator);
             }
         }
+        break;
+
+    case kIROp_UntypedResourceHandleType:
+    case kIROp_UntypedSamplerHandleType:
+        // `lowerUntypedResourceHandleToUInt` rewrites every untyped descriptor-heap handle to
+        // `uint` before emit, so one reaching here is an internal error (a leak from that pass).
+        SLANG_UNEXPECTED("untyped descriptor-heap handle type should have been lowered to uint");
         break;
 
     case kIROp_ArrayType:
@@ -1319,6 +1325,13 @@ void CLikeSourceEmitter::emitSimpleValueImpl(IRInst* inst)
             {
                 switch (type->getBaseType())
                 {
+                case BaseType::Bool:
+                    // `lowerEnumType` canonicalizes every `bool`-tagged enumerator constant to
+                    // `kIROp_BoolLit`, so a `bool`-typed `IRIntLit` must never reach emit here
+                    // (it would print via the `int8_t` arm below). See shader-slang/slang#12298.
+                    SLANG_UNEXPECTED("bool-typed IRIntLit should have been lowered to IRBoolLit");
+                    break;
+
                 default:
 
                 case BaseType::Int8:
@@ -1436,6 +1449,49 @@ void CLikeSourceEmitter::emitSimpleValueImpl(IRInst* inst)
     }
 }
 
+// Return true when `inst` is a module-scope aggregate literal (`MakeArray`/`MakeStruct`/
+// `MakeArrayFromElement`) that is only ever used inside another such aggregate. Under that
+// condition the inst is only ever emitted inside an outer aggregate's brace initializer list — a
+// context where an initializer-list value is valid — so it is safe to fold inline, unlike a
+// function-body aggregate whose value may appear in a general expression context. Folding matters
+// because the alternative — emitting the inst as its own named module-scope declaration — makes the
+// outer aggregate's initializer reference it by name, which is an illegal cross-declaration
+// reference in a static initializer on some targets (a dynamic `__device__` initializer NVRTC
+// rejects on CUDA, an inter-`var<private>` reference on WGSL).
+static bool isInnerGlobalAggregate(IRInst* inst)
+{
+    switch (inst->getOp())
+    {
+    case kIROp_MakeArray:
+    case kIROp_MakeStruct:
+    case kIROp_MakeArrayFromElement:
+        break;
+    default:
+        return false;
+    }
+
+    if (!inst->getParent() || inst->getParent()->getOp() != kIROp_ModuleInst)
+        return false;
+
+    // A use-less module-scope aggregate has no constituent context to fold into, so keep it as a
+    // declaration rather than folding it away.
+    if (!inst->firstUse)
+        return false;
+    for (auto use = inst->firstUse; use; use = use->nextUse)
+    {
+        switch (use->getUser()->getOp())
+        {
+        case kIROp_MakeArray:
+        case kIROp_MakeStruct:
+        case kIROp_MakeArrayFromElement:
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
 bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
 {
     // Certain opcodes should never/always be folded in
@@ -1464,6 +1520,10 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     case kIROp_MetalCastToDepthTexture:
     case kIROp_LoadResourceDescriptorFromHeap:
     case kIROp_LoadSamplerDescriptorFromHeap:
+    case kIROp_CoopMatMulAdd:
+    case kIROp_CoopVecMatMulAdd:
+    case kIROp_CoopVecOuterProductAccumulate:
+    case kIROp_CoopVecReduceSumAccumulate:
         return false;
 
     // Always fold these in, because they are trivial
@@ -1521,7 +1581,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     case kIROp_MakeArrayFromElement:
     case kIROp_MakeCoopVector:
 
-        return false;
+        return isInnerGlobalAggregate(inst);
     }
 
     // Instructions with specific result *types* will usually
@@ -1550,7 +1610,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     }
 
     // Don't allow temporaries of pointer types to be created,
-    // if target langauge doesn't support pointers.
+    // if target language doesn't support pointers.
     if (as<IRPtrTypeBase>(type))
     {
         if (!doesTargetSupportPtrTypes())
@@ -1873,7 +1933,7 @@ void CLikeSourceEmitter::emitDereferenceOperand(IRInst* inst, EmitOpInfo const& 
                 IRVectorType* vectorType = nullptr;
                 if (auto ptrType = as<IRPtrTypeBase>(inst->getOperand(0)->getDataType()))
                 {
-                    vectorType = as<IRVectorType>(ptrType->getValueType());
+                    vectorType = as<IRVectorType>(unwrapAttributedType(ptrType->getValueType()));
                 }
                 if (vectorType)
                 {
@@ -2566,6 +2626,14 @@ void CLikeSourceEmitter::defaultEmitInstExpr(IRInst* inst, const EmitOpInfo& inO
     case kIROp_CastDescriptorHandleToUInt64:
         emitOperand(inst->getOperand(0), outerPrec);
         break;
+    case kIROp_CastUIntToUntypedResourceHandle:
+    case kIROp_CastUntypedResourceHandleToUInt:
+    case kIROp_CastUIntToUntypedSamplerHandle:
+    case kIROp_CastUntypedSamplerHandleToUInt:
+        // The untyped descriptor-heap handle wrap/unwrap casts are an internal representation that
+        // `lowerUntypedResourceHandleToUInt` forwards to their `uint` operand and removes before
+        // emit. Seeing one here means that pass did not run (or ran too late), so this is a bug.
+        SLANG_UNEXPECTED("untyped descriptor-heap handle cast should have been lowered to uint");
     // Binary ops
     case kIROp_Add:
     case kIROp_Sub:
@@ -3056,7 +3124,9 @@ void CLikeSourceEmitter::defaultEmitInstExpr(IRInst* inst, const EmitOpInfo& inO
     case kIROp_GetStringHash:
         {
             auto getStringHashInst = as<IRGetStringHash>(inst);
-            auto stringLit = getStringHashInst->getStringLit();
+            // `getStringLit()` casts operand 0 without checking, so it cannot be used to decide
+            // whether the operand really is a literal; that is what the `else` below is for.
+            auto stringLit = as<IRStringLit>(getStringHashInst->getOperand(0));
 
             if (stringLit)
             {
@@ -3217,6 +3287,7 @@ void CLikeSourceEmitter::_emitInst(IRInst* inst)
     case kIROp_DebugInlinedVariable:
     case kIROp_DebugFunction:
     case kIROp_DebugBuildIdentifier:
+    case kIROp_DebugCompilationUnit:
         break;
 
     case kIROp_Unmodified:
@@ -3241,6 +3312,10 @@ void CLikeSourceEmitter::_emitInst(IRInst* inst)
     case kIROp_MetalAtomicCast:
     case kIROp_MetalCastToDepthTexture:
     case kIROp_SetOptiXPayloadRegister:
+    case kIROp_CoopMatMulAdd:
+    case kIROp_CoopVecMatMulAdd:
+    case kIROp_CoopVecOuterProductAccumulate:
+    case kIROp_CoopVecReduceSumAccumulate:
         emitInstStmt(inst);
         break;
 
@@ -3559,7 +3634,29 @@ void CLikeSourceEmitter::emitSwitchCaseSelectorsImpl(
     }
 }
 
-void CLikeSourceEmitter::emitRegion(Region* inRegion)
+// Walk the top-level region chain of a switch `case` body to its final region, and return
+// that region if it is a `break` that exits `switchRegion` itself. This is the redundant
+// break a non-fall-through target places at the tail of every case — because such a case
+// never falls through, reaching the end of the body already exits the switch. Any other
+// terminal (a `return`/`discard` folded into a `SimpleRegion`, a `continue`, or a `break`
+// targeting an enclosing loop) returns null, as does a nested/early break, since only the
+// top-level `nextRegion` chain is followed here.
+static Region* findSwitchCaseTerminatingBreak(Region* caseBody, SwitchRegion* switchRegion)
+{
+    // `break`/`continue` are leaf regions; every other flavor derives from `SeqRegion` and
+    // links to what follows it through `nextRegion`, so follow that chain to its end.
+    Region* region = caseBody;
+    while (region && region->getFlavor() != Region::Flavor::Break &&
+           region->getFlavor() != Region::Flavor::Continue)
+    {
+        region = static_cast<SeqRegion*>(region)->nextRegion.Ptr();
+    }
+    if (!region || region->getFlavor() != Region::Flavor::Break)
+        return nullptr;
+    return (static_cast<BreakRegion*>(region)->outerRegion == switchRegion) ? region : nullptr;
+}
+
+void CLikeSourceEmitter::emitRegion(Region* inRegion, Region* breakRegionToOmit)
 {
     // We will use a loop so that we can process sequential (simple)
     // regions iteratively rather than recursively.
@@ -3627,7 +3724,10 @@ void CLikeSourceEmitter::emitRegion(Region* inRegion)
         // don't need to consider multi-level break/continue (which we
         // don't for now).
         case Region::Flavor::Break:
-            m_writer->emit("break;\n");
+            // Skip the specific switch-terminating break a break-free target asked us to
+            // omit; emit every other break normally.
+            if (region != breakRegionToOmit)
+                m_writer->emit("break;\n");
             break;
         case Region::Flavor::Continue:
             m_writer->emit("continue;\n");
@@ -3714,6 +3814,14 @@ void CLikeSourceEmitter::emitRegion(Region* inRegion)
                 m_writer->emit(")\n{\n");
 
                 auto defaultCase = switchRegion->defaultCase;
+
+                // When a target's switch cases never fall through, the `break` Slang places
+                // at the tail of each case only exists to exit the switch — which already
+                // happens on reaching the case's end. Most such targets still need it emitted
+                // (FXC for HLSL SM 5.x rejects a case without a terminating break), but WGSL
+                // prefers break-free output and older `naga` validators reject `break` outside
+                // a loop, so WGSL opts out via shouldEmitSwitchCaseTerminatingBreak().
+                bool emitTerminatingBreak = shouldEmitSwitchCaseTerminatingBreak();
                 for (auto currentCase : switchRegion->cases)
                 {
                     bool isDefault = (currentCase.Ptr() == defaultCase);
@@ -3721,7 +3829,11 @@ void CLikeSourceEmitter::emitRegion(Region* inRegion)
                     m_writer->indent();
                     m_writer->emit("{\n");
                     m_writer->indent();
-                    emitRegion(currentCase->body);
+                    Region* breakToOmit =
+                        emitTerminatingBreak
+                            ? nullptr
+                            : findSwitchCaseTerminatingBreak(currentCase->body, switchRegion);
+                    emitRegion(currentCase->body, breakToOmit);
                     m_writer->dedent();
                     m_writer->emit("}\n");
                     m_writer->dedent();
@@ -3805,9 +3917,12 @@ void CLikeSourceEmitter::emitSimpleFuncParamImpl(IRParam* param)
             layout->usesResourceKind(LayoutResourceKind::VaryingOutput))
         {
             emitInterpolationModifiers(param, paramType, layout);
-            emitMeshShaderModifiers(param);
         }
     }
+
+    // Emit mesh-output qualifiers unconditionally: they key off the parameter's
+    // decoration, not its varying-IO layout (which an SV-only output never registers).
+    emitMeshShaderModifiers(param);
 
     emitParamType(paramType, paramName);
     emitSemantics(param);
@@ -4643,8 +4758,12 @@ void CLikeSourceEmitter::emitVarModifiers(IRVarLayout* layout, IRInst* varDecl, 
         layout->usesResourceKind(LayoutResourceKind::VaryingOutput))
     {
         emitInterpolationModifiers(varDecl, varType, layout);
-        emitMeshShaderModifiers(varDecl);
     }
+
+    // Mesh output decorations do not always come with a varying-output layout kind
+    // (for example, OutputVertices can lower to a plain array layout), so gate on the
+    // decoration itself instead of the layout classification.
+    emitMeshShaderModifiers(varDecl);
 
     // Output target specific qualifiers
     emitLayoutQualifiersImpl(layout);
@@ -5216,6 +5335,12 @@ void CLikeSourceEmitter::ensureGlobalInst(
         return;
     case kIROp_ThisType:
         return;
+    case kIROp_BuiltinRequirementKey:
+        // A built-in interface requirement key is metadata (like an interface
+        // requirement entry); it never corresponds to emitted code. Unlike an
+        // ordinary `StructKey`, this key is hoistable and so may survive as an
+        // (unreferenced) global inst after specialization, so skip it explicitly.
+        return;
     case kIROp_DebugInlinedAt:
     case kIROp_DebugScope:
     case kIROp_DebugNoScope:
@@ -5226,6 +5351,7 @@ void CLikeSourceEmitter::ensureGlobalInst(
     case kIROp_DebugValue:
     case kIROp_DebugInlinedVariable:
     case kIROp_DebugBuildIdentifier:
+    case kIROp_DebugCompilationUnit:
         return;
     default:
         break;

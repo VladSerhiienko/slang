@@ -1,8 +1,8 @@
 // slang-target.cpp
 #include "slang-target.h"
 
-#include "../core/slang-type-text-util.h"
 #include "compiler-core/slang-artifact-desc-util.h"
+#include "core/slang-type-text-util.h"
 #include "slang-compiler.h"
 #include "slang-type-layout.h"
 
@@ -46,6 +46,8 @@ Session* TargetRequest::getSession()
 
 HLSLToVulkanLayoutOptions* TargetRequest::getHLSLToVulkanLayoutOptions()
 {
+    // Layout code can ask for these options from multiple threads; initialize them once.
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!hlslToVulkanOptions)
     {
         hlslToVulkanOptions = new HLSLToVulkanLayoutOptions();
@@ -56,11 +58,15 @@ HLSLToVulkanLayoutOptions* TargetRequest::getHLSLToVulkanLayoutOptions()
 
 void TargetRequest::setTargetCaps(CapabilitySet capSet)
 {
+    // Some callers precompute capabilities while others read them during layout/codegen.
+    std::lock_guard<std::mutex> lock(m_mutex);
     cookedCapabilities = capSet;
 }
 
 CapabilitySet TargetRequest::getTargetCaps()
 {
+    // Capabilities are derived lazily and shared across entry-point compiles for the same target.
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!cookedCapabilities.isEmpty())
         return cookedCapabilities;
 
@@ -109,7 +115,8 @@ CapabilitySet TargetRequest::getTargetCaps()
                 {
                     for (auto atom : profileCapAtomSet)
                     {
-                        if (isTargetVersionAtom(asAtom(atom)))
+                        // SPIR-V code-gen path: pull only SPIR-V version atoms from the profile.
+                        if (isSpirvVersionAtom(asAtom(atom)))
                         {
                             atoms.add((CapabilityName)atom);
                             hasTargetVersionAtom = true;

@@ -7,9 +7,9 @@
 #define SLANG_HANDLE_RESULT_FAIL(x) SLANG_ASSERT(!"failure")
 #endif
 
-#include "../../source/compiler-core/slang-command-line-args.h"
-#include "../../source/core/slang-process-util.h"
-#include "../../source/core/slang-writer.h"
+#include "compiler-core/slang-command-line-args.h"
+#include "core/slang-process-util.h"
+#include "core/slang-writer.h"
 #include "slang-com-helper.h"
 
 #include <slang-rhi.h>
@@ -100,6 +100,8 @@ struct Options
     bool cacheRhiDevice = false;
 
     bool useLLVMDirectly = false;
+
+    bool compileOnly = false;
 
     Slang::List<Slang::String> capabilities;
 

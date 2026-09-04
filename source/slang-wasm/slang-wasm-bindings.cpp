@@ -16,10 +16,8 @@ EMSCRIPTEN_BINDINGS(slang)
     function("getCompileTargets", &slang::wgsl::getCompileTargets);
 
     class_<slang::wgsl::GlobalSession>("GlobalSession")
-        .function(
-            "createSession",
-            &slang::wgsl::GlobalSession::createSession,
-            allow_raw_pointers());
+        .function("createSession", &slang::wgsl::GlobalSession::createSession, allow_raw_pointers())
+        .function("getBuiltinModuleSource", &slang::wgsl::GlobalSession::getBuiltinModuleSource);
 
     function("createGlobalSession", &slang::wgsl::createGlobalSession, allow_raw_pointers());
 
@@ -74,7 +72,8 @@ EMSCRIPTEN_BINDINGS(slang)
             "getUserAttributeByIndex",
             &slang::wgsl::VariableReflection::getUserAttributeByIndex,
             allow_raw_pointers())
-        .function("hasDefaultValue", &slang::wgsl::VariableReflection::hasDefaultValue);
+        .function("hasDefaultValue", &slang::wgsl::VariableReflection::hasDefaultValue)
+        .function("getDefaultValueBlob", &slang::wgsl::VariableReflection::getDefaultValueBlob);
 
 
     class_<slang::wgsl::VariableLayoutReflection>("VariableLayoutReflection")
@@ -157,7 +156,12 @@ EMSCRIPTEN_BINDINGS(slang)
         .value("Int8", slang::TypeReflection::ScalarType::Int8)
         .value("UInt8", slang::TypeReflection::ScalarType::UInt8)
         .value("Int16", slang::TypeReflection::ScalarType::Int16)
-        .value("UInt16", slang::TypeReflection::ScalarType::UInt16);
+        .value("UInt16", slang::TypeReflection::ScalarType::UInt16)
+        .value("IntPtr", slang::TypeReflection::ScalarType::IntPtr)
+        .value("UIntPtr", slang::TypeReflection::ScalarType::UIntPtr)
+        .value("BFloat16", slang::TypeReflection::ScalarType::BFloat16)
+        .value("FloatE4M3", slang::TypeReflection::ScalarType::FloatE4M3)
+        .value("FloatE5M2", slang::TypeReflection::ScalarType::FloatE5M2);
 
     class_<slang::wgsl::TypeReflection>("TypeReflection")
         .function("getScalarType", &slang::wgsl::TypeReflection::getScalarType)
@@ -237,6 +241,14 @@ EMSCRIPTEN_BINDINGS(slang)
         .function(
             "findFunctionByName",
             &slang::wgsl::ProgramLayout::findFunctionByName,
+            allow_raw_pointers())
+        .function(
+            "findTypeByName",
+            &slang::wgsl::ProgramLayout::findTypeByName,
+            allow_raw_pointers())
+        .function(
+            "findVarByNameInType",
+            &slang::wgsl::ProgramLayout::findVarByNameInType,
             allow_raw_pointers());
 
     enum_<slang::BindingType>("BindingType")

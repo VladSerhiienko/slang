@@ -349,6 +349,13 @@ struct ModifyingExprVisitor : ExprVisitor<Derived, Expr*>
         e->typeExpr = dispatchIfNotNull(e->typeExpr);
         return e;
     }
+    Expr* visitCastOptionalExpr(CastOptionalExpr* e)
+    {
+        e->valueArg = dispatchIfNotNull(e->valueArg);
+        // innerVarDecl is synthetic — do not dispatch
+        e->innerCoercedExpr = dispatchIfNotNull(e->innerCoercedExpr);
+        return e;
+    }
 
     // --- Existential ---
     // Note: ExtractExistentialValueExpr has originalExpr for language server only (not traversed)
@@ -422,6 +429,29 @@ struct ModifyingExprVisitor : ExprVisitor<Derived, Expr*>
     Expr* visitSizeOfLikeExpr(SizeOfLikeExpr* e)
     {
         e->value = dispatchIfNotNull(e->value);
+        e->dataLayout = dispatchIfNotNull(e->dataLayout);
+        return e;
+    }
+
+    // --- Pack queries ---
+    Expr* visitPackQueryExpr(PackQueryExpr* e)
+    {
+        e->value = dispatchIfNotNull(e->value);
+        return e;
+    }
+
+    Expr* visitShapePackTransformExpr(ShapePackTransformExpr* e)
+    {
+        for (auto& arg : e->args)
+            arg = dispatchIfNotNull(arg);
+        return e;
+    }
+
+    Expr* visitPackBranchTypeExpr(PackBranchTypeExpr* e)
+    {
+        e->packOperand.exp = dispatchIfNotNull(e->packOperand.exp);
+        e->emptyType.exp = dispatchIfNotNull(e->emptyType.exp);
+        e->nonEmptyType.exp = dispatchIfNotNull(e->nonEmptyType.exp);
         return e;
     }
 

@@ -822,11 +822,14 @@ IRInst* generateHostParamForCUDAParam(
         builder->addNameHintDecoration(hostParam, nameHint->getName());
     }
 
-    // Then cast the param to the appropriate type.
-    if (auto castedParam = castHostToCUDAType(builder, type, param->getDataType(), hostParam))
-        return castedParam;
-
-    return nullptr;
+    // Cast the host param to the CUDA parameter type. We reach here only for a diagnostic-free
+    // mapping (the guard above returns on any sink error), and every shape castHostToCUDAType
+    // sees for such a type — basic/vector/matrix (identity) and TensorView/struct/array (its cast
+    // cases) — yields a non-null result. A null would be an out-of-contract shape; fail loudly,
+    // as castHostToCUDAType's own recursive calls already do.
+    auto castedParam = castHostToCUDAType(builder, type, param->getDataType(), hostParam);
+    SLANG_RELEASE_ASSERT(castedParam);
+    return castedParam;
 }
 
 void markTypeForPyExport(IRType* type, DiagnosticSink* sink)
@@ -1054,11 +1057,31 @@ IRFunc* generateCUDAWrapperForFunc(IRFunc* func, DiagnosticSink* sink)
     List<IRInst*> mappedParams;
     for (auto param : func->getFirstBlock()->getParams())
     {
-        IRType* hostParamType;
-        mappedParams.add(generateHostParamForCUDAParam(&builder, param, sink, &hostParamType));
+        IRType* hostParamType = nullptr;
+        auto mappedParam = generateHostParamForCUDAParam(&builder, param, sink, &hostParamType);
+
+        // A null result means generateHostParamForCUDAParam bailed: either this parameter had no
+        // host mapping (E56001 was emitted) or the sink already held an error. Either way a
+        // diagnostic exists, so discard the partial wrapper rather than build an IRDispatchKernel
+        // with a null operand. removeAndDeallocate is safe here: hostFunc's type, dispatch inst,
+        // and decorations are all created after this loop, so nothing outside references it; the
+        // params and casts already emitted into it are freed with it, and the partially-filled
+        // mappedParams / hostParamTypes lists are abandoned unread.
+        if (!mappedParam)
+        {
+            hostFunc->removeAndDeallocate();
+            return nullptr;
+        }
+
+        mappedParams.add(mappedParam);
         hostParamTypes.add(hostParamType);
-        markTypeForPyExport(param->getDataType(), sink); // Should we be marking the host type?
     }
+
+    // Marking is deferred until every parameter maps so an abandoned wrapper adds no
+    // IRPyExportDecoration reflection roots.
+    // TODO: confirm whether PyExport reflection should root the translated host type instead.
+    for (auto param : func->getFirstBlock()->getParams())
+        markTypeForPyExport(param->getDataType(), sink);
 
     // Dispatch the original function.
     builder.emitDispatchKernelInst(
@@ -1336,7 +1359,7 @@ void handleAutoBindNames(IRModule* module)
     //
     for (auto globalInst : module->getGlobalInsts())
     {
-        if (globalInst->findDecoration<IRAutoPyBindCudaDecoration>())
+        if (auto autobindDecor = globalInst->findDecoration<IRAutoPyBindCudaDecoration>())
         {
             // Find an extern decoration on the original function, and append a prefix to the name.
             if (auto externCppHint = globalInst->findDecoration<IRExternCppDecoration>())
@@ -1349,6 +1372,8 @@ void handleAutoBindNames(IRModule* module)
                 externCppHint->removeAndDeallocate();
                 builder.addExternCppDecoration(globalInst, nameBuilder.getUnownedSlice());
             }
+
+            autobindDecor->removeAndDeallocate();
         }
     }
 }
@@ -1383,11 +1408,10 @@ void generateDerivativeWrappers(IRModule* module, DiagnosticSink* sink)
         if (!as<IRFunc>(globalInst))
             continue;
 
-        // Look for methods marked with auto-bind and are differentiable.
-        if (globalInst->findDecoration<IRAutoPyBindCudaDecoration>())
+        // Look for methods marked with auto-bind and have derivatives registered.
+        if (auto autoBindDecoration = globalInst->findDecoration<IRAutoPyBindCudaDecoration>())
         {
-            if (globalInst->findDecoration<IRForwardDifferentiableDecoration>() ||
-                globalInst->findDecoration<IRBackwardDifferentiableDecoration>())
+            if (autoBindDecoration->getFwdDiffFuncOperand())
             {
                 // We'll generate a wrapper for this method that calls fwd_diff(fn)
                 // but an important thing to note is that we won't actually employ the usual
@@ -1425,10 +1449,9 @@ void generateDerivativeWrappers(IRModule* module, DiagnosticSink* sink)
 
                 wrapperFunc->setFullType(func->getFullType());
 
-                auto fwdDiffFunc = builder.emitForwardDifferentiateInst(func->getFullType(), func);
                 auto fwdDiffCall = builder.emitCallInst(
                     func->getResultType(),
-                    fwdDiffFunc,
+                    autoBindDecoration->getFwdDiffFuncOperand(),
                     params.getCount(),
                     params.getBuffer());
 
@@ -1464,7 +1487,7 @@ void generateDerivativeWrappers(IRModule* module, DiagnosticSink* sink)
                 builder.addCudaKernelForwardDerivativeDecoration(func, wrapperFunc);
             }
 
-            if (globalInst->findDecoration<IRBackwardDifferentiableDecoration>())
+            if (autoBindDecoration->getBwdDiffFuncOperand())
             {
                 // The reasoning for the reverse-mode is the same as the forward-mode version
                 // (see above)
@@ -1492,14 +1515,13 @@ void generateDerivativeWrappers(IRModule* module, DiagnosticSink* sink)
 
                 wrapperFunc->setFullType(func->getFullType());
 
-                auto fwdDiffFunc = builder.emitBackwardDifferentiateInst(func->getFullType(), func);
-                auto fwdDiffCall = builder.emitCallInst(
+                auto bwdDiffCall = builder.emitCallInst(
                     func->getResultType(),
-                    fwdDiffFunc,
+                    autoBindDecoration->getBwdDiffFuncOperand(),
                     params.getCount(),
                     params.getBuffer());
 
-                builder.emitReturn(fwdDiffCall);
+                builder.emitReturn(bwdDiffCall);
 
                 // If the original func is a CUDA kernel, mark the wrapper as a CUDA kernel as well.
                 if (func->findDecoration<IRCudaKernelDecoration>())

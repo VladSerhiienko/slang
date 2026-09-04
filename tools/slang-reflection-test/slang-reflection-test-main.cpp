@@ -1,14 +1,13 @@
 // slang-reflection-test-main.cpp
 
-#include "../../source/compiler-core/slang-pretty-writer.h"
-#include "../../source/core/slang-char-util.h"
-#include "../../source/core/slang-string-escape-util.h"
-#include "../../source/core/slang-string-util.h"
-#include "../../source/core/slang-test-tool-util.h"
+#include "compiler-core/slang-pretty-writer.h"
+#include "core/slang-char-util.h"
+#include "core/slang-string-escape-util.h"
+#include "core/slang-string-util.h"
+#include "core/slang-test-tool-util.h"
 #include "slang-com-helper.h"
 #include "slang.h"
 
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,10 +63,6 @@ innerMain(Slang::StdWriters* stdWriters, SlangSession* session, int argc, const 
         const auto channel = SlangWriterChannel(i);
         spSetWriter(request, channel, stdWriters->getWriter(channel));
     }
-
-    char const* appName = "slang-reflection-test";
-    if (argc > 0)
-        appName = argv[0];
 
     SlangResult res = performCompilationAndReflection(request, argc, argv);
 
