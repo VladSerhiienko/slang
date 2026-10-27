@@ -189,6 +189,13 @@ class SlangConan(ConanFile):
             self.options.enable_slang_rhi = False
             self.options.enable_dxil = False
 
+        # The Emscripten toolchain has no objcopy, which the non-Apple split-debug-info
+        # post-build step runs on every executable and shared library; slang-dispatcher
+        # is built on every platform, so a wasm build would fail there. Upstream's
+        # emscripten CMake preset disables split debug info for the same reason.
+        if self.settings.os == "Emscripten":
+            self.options.enable_split_debug_info = False
+
     def configure(self):
         if self.options.shared:
             self.options.rm_safe("fPIC")
