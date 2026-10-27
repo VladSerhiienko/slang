@@ -2903,9 +2903,15 @@ LayoutRulesImpl* WGSLLayoutRulesFamilyImpl::getParameterBlockRules(CompilerOptio
     return &kStd140LayoutRulesImpl_;
 }
 
+// WGSL has no push constants, so a `[[vk::push_constant]]` buffer is laid out as an
+// ordinary uniform buffer on this target, exactly as HLSL and Metal do for theirs: it
+// takes a `@group`/`@binding` slot like any other `ConstantBuffer` and std140 layout.
+// With the GLSL push-constant rules it would consume a `PushConstantBuffer` resource,
+// which the WGSL emitter cannot express, and be emitted as a `var<uniform>` without
+// binding attributes and with std430 layout, which no WebGPU pipeline accepts.
 LayoutRulesImpl* WGSLLayoutRulesFamilyImpl::getPushConstantBufferRules()
 {
-    return &kGLSLPushConstantLayoutRulesImpl_;
+    return &kWGSLConstantBufferLayoutRulesImpl_;
 }
 
 LayoutRulesImpl* WGSLLayoutRulesFamilyImpl::getShaderRecordConstantBufferRules()

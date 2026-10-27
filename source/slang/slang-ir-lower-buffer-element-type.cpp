@@ -2491,8 +2491,12 @@ IRTypeLayoutRuleName getTypeLayoutRuleNameForBuffer(TargetProgram* target, IRTyp
                                     ? parameterGroupType->getDataLayout()->getOp()
                                     : kIROp_DefaultBufferLayoutType;
 
-            // DefaultPushConstantBufferLayoutType defaults to Std430.
-            if (layoutTypeOp == kIROp_DefaultPushConstantBufferLayoutType)
+            // DefaultPushConstantBufferLayoutType defaults to Std430, except on WGSL: that
+            // target has no push constants, so a push-constant buffer is an ordinary uniform
+            // buffer there (WGSLLayoutRulesFamilyImpl::getPushConstantBufferRules) and takes the
+            // std140 default the uniform address space requires.
+            if (layoutTypeOp == kIROp_DefaultPushConstantBufferLayoutType &&
+                targetReq->getTarget() != CodeGenTarget::WGSL)
                 return IRTypeLayoutRuleName::Std430;
 
             // The CPU targets default to the C buffer layout for compatibility
