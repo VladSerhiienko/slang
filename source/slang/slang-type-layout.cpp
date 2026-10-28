@@ -509,6 +509,13 @@ struct Std430LayoutRulesImpl : GLSLBaseLayoutRulesImpl
     // base/common GLSL layout rules.
 };
 
+/// The `std430` layout rules for a D3D structured buffer: D3D manages the counter
+/// of an append/consume structured buffer itself.
+struct HLSLStd430StructuredBufferLayoutRulesImpl : Std430LayoutRulesImpl
+{
+    bool DoStructuredBuffersNeedSeparateCounterBuffer() override { return false; }
+};
+
 /// The GLSL `std430` layout rules.
 struct Std140LayoutRulesImpl : GLSLBaseLayoutRulesImpl
 {
@@ -1317,6 +1324,7 @@ struct CUDARayTracingLayoutRulesImpl : DefaultVaryingLayoutRulesImpl
 DefaultLayoutRulesImpl kDefaultLayoutRulesImpl;
 Std140LayoutRulesImpl kStd140LayoutRulesImpl;
 Std430LayoutRulesImpl kStd430LayoutRulesImpl;
+HLSLStd430StructuredBufferLayoutRulesImpl kHLSLStd430StructuredBufferLayoutRulesImpl;
 FXCShaderResourceLayoutRulesImpl kFXCShaderResourceLayoutRulesImpl;
 HLSLConstantBufferLayoutRulesImpl kHLSLConstantBufferLayoutRulesImpl;
 HLSLStructuredBufferLayoutRulesImpl kHLSLStructuredBufferLayoutRulesImpl;
@@ -1377,7 +1385,9 @@ struct GLSLLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
     LayoutRulesImpl* getShaderRecordConstantBufferRules() override;
     LayoutRulesImpl* getEntryPointParameterRules() override;
 
-    LayoutRulesImpl* getStructuredBufferRules(CompilerOptionSet& compilerOptions) override;
+    LayoutRulesImpl* getStructuredBufferRules(
+        CompilerOptionSet& compilerOptions,
+        Type* containerType) override;
 };
 
 struct HLSLLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
@@ -1402,7 +1412,9 @@ struct HLSLLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
     LayoutRulesImpl* getShaderRecordConstantBufferRules() override;
     LayoutRulesImpl* getEntryPointParameterRules() override;
 
-    LayoutRulesImpl* getStructuredBufferRules(CompilerOptionSet& compilerOptions) override;
+    LayoutRulesImpl* getStructuredBufferRules(
+        CompilerOptionSet& compilerOptions,
+        Type* containerType) override;
 };
 
 struct CPULayoutRulesFamilyImpl : LayoutRulesFamilyImpl
@@ -1426,7 +1438,9 @@ struct CPULayoutRulesFamilyImpl : LayoutRulesFamilyImpl
 
     LayoutRulesImpl* getShaderRecordConstantBufferRules() override;
     LayoutRulesImpl* getEntryPointParameterRules() override;
-    LayoutRulesImpl* getStructuredBufferRules(CompilerOptionSet& compilerOptions) override;
+    LayoutRulesImpl* getStructuredBufferRules(
+        CompilerOptionSet& compilerOptions,
+        Type* containerType) override;
 };
 
 struct LLVMLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
@@ -1450,7 +1464,9 @@ struct LLVMLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
 
     LayoutRulesImpl* getShaderRecordConstantBufferRules() override;
     LayoutRulesImpl* getEntryPointParameterRules() override;
-    LayoutRulesImpl* getStructuredBufferRules(CompilerOptionSet& compilerOptions) override;
+    LayoutRulesImpl* getStructuredBufferRules(
+        CompilerOptionSet& compilerOptions,
+        Type* containerType) override;
 };
 
 struct CLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
@@ -1474,7 +1490,9 @@ struct CLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
 
     LayoutRulesImpl* getShaderRecordConstantBufferRules() override;
     LayoutRulesImpl* getEntryPointParameterRules() override;
-    LayoutRulesImpl* getStructuredBufferRules(CompilerOptionSet& compilerOptions) override;
+    LayoutRulesImpl* getStructuredBufferRules(
+        CompilerOptionSet& compilerOptions,
+        Type* containerType) override;
 };
 
 struct CUDALayoutRulesFamilyImpl : LayoutRulesFamilyImpl
@@ -1498,7 +1516,9 @@ struct CUDALayoutRulesFamilyImpl : LayoutRulesFamilyImpl
 
     LayoutRulesImpl* getShaderRecordConstantBufferRules() override;
     LayoutRulesImpl* getEntryPointParameterRules() override;
-    LayoutRulesImpl* getStructuredBufferRules(CompilerOptionSet& compilerOptions) override;
+    LayoutRulesImpl* getStructuredBufferRules(
+        CompilerOptionSet& compilerOptions,
+        Type* containerType) override;
 };
 
 struct MetalLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
@@ -1522,7 +1542,9 @@ struct MetalLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
 
     LayoutRulesImpl* getShaderRecordConstantBufferRules() override;
     LayoutRulesImpl* getEntryPointParameterRules() override;
-    LayoutRulesImpl* getStructuredBufferRules(CompilerOptionSet& compilerOptions) override;
+    LayoutRulesImpl* getStructuredBufferRules(
+        CompilerOptionSet& compilerOptions,
+        Type* containerType) override;
 };
 
 struct MetalArgumentBufferTier2LayoutRulesFamilyImpl : MetalLayoutRulesFamilyImpl
@@ -1554,7 +1576,9 @@ struct WGSLLayoutRulesFamilyImpl : LayoutRulesFamilyImpl
 
     LayoutRulesImpl* getShaderRecordConstantBufferRules() override;
     LayoutRulesImpl* getEntryPointParameterRules() override;
-    LayoutRulesImpl* getStructuredBufferRules(CompilerOptionSet& compilerOptions) override;
+    LayoutRulesImpl* getStructuredBufferRules(
+        CompilerOptionSet& compilerOptions,
+        Type* containerType) override;
 };
 
 GLSLLayoutRulesFamilyImpl kGLSLLayoutRulesFamilyImpl;
@@ -1947,9 +1971,25 @@ LayoutRulesImpl kHLSLConstantBufferLayoutRulesImpl_ = {
     &kHLSLObjectLayoutRulesImpl,
 };
 
+// A `ConstantBuffer<T, Std140DataLayout>` keeps the std140 layout on HLSL targets;
+// buffer element lowering inserts the padding members that make FXC packing agree.
+LayoutRulesImpl kHLSLStd140ConstantBufferLayoutRulesImpl_ = {
+    &kHLSLLayoutRulesFamilyImpl,
+    &kStd140LayoutRulesImpl,
+    &kHLSLObjectLayoutRulesImpl,
+};
+
 LayoutRulesImpl kHLSLStructuredBufferLayoutRulesImpl_ = {
     &kHLSLLayoutRulesFamilyImpl,
     &kHLSLStructuredBufferLayoutRulesImpl,
+    &kHLSLObjectLayoutRulesImpl,
+};
+
+// A `StructuredBuffer<T, Std430DataLayout>` keeps the std430 layout on HLSL targets;
+// buffer element lowering inserts the padding members that make D3D packing agree.
+LayoutRulesImpl kHLSLStd430StructuredBufferLayoutRulesImpl_ = {
+    &kHLSLLayoutRulesFamilyImpl,
+    &kHLSLStd430StructuredBufferLayoutRulesImpl,
     &kHLSLObjectLayoutRulesImpl,
 };
 
@@ -2034,6 +2074,29 @@ LayoutRulesImpl kLLVMCLayoutRulesImpl_ = {
 LayoutRulesImpl* GLSLLayoutRulesFamilyImpl::getAnyValueRules()
 {
     return &kGLSLAnyValueLayoutRulesImpl_;
+}
+
+// Return true if `containerType` is a `ConstantBuffer<T, Std140DataLayout>`. Such a
+// buffer has the std140 layout on every target that accepts the layout type, so
+// targets whose native constant-buffer packing differs (HLSL, Metal) select std140
+// rules for it instead of their native rules.
+static bool isStd140ConstantBufferType(Type* containerType)
+{
+    auto cbufferType = as<ConstantBufferType>(containerType);
+    return cbufferType &&
+           cbufferType->getLayoutType()->astNodeType == ASTNodeType::Std140DataLayoutType;
+}
+
+// Return true if `containerType` is a `StructuredBuffer<T, Std430DataLayout>` (or one of
+// its read-write, append, consume or rasterizer-ordered variants). Such a buffer has the
+// std430 layout on every target that accepts the layout type.
+static bool isStd430StructuredBufferType(Type* containerType)
+{
+    auto bufferType = as<HLSLStructuredBufferTypeBase>(containerType);
+    if (!bufferType)
+        return false;
+    auto layoutType = bufferType->getLayoutType();
+    return layoutType && layoutType->astNodeType == ASTNodeType::Std430DataLayoutType;
 }
 
 LayoutRulesImpl* GLSLLayoutRulesFamilyImpl::getConstantBufferRules(
@@ -2162,7 +2225,8 @@ LayoutRulesImpl* GLSLLayoutRulesFamilyImpl::getHitAttributesParameterRules()
 }
 
 LayoutRulesImpl* GLSLLayoutRulesFamilyImpl::getStructuredBufferRules(
-    CompilerOptionSet& compilerOptions)
+    CompilerOptionSet& compilerOptions,
+    Type*)
 {
     if (compilerOptions.shouldUseScalarLayout())
         return &kScalarLayoutRulesImpl_;
@@ -2181,8 +2245,12 @@ LayoutRulesImpl* HLSLLayoutRulesFamilyImpl::getAnyValueRules()
     return &kHLSLAnyValueLayoutRulesImpl_;
 }
 
-LayoutRulesImpl* HLSLLayoutRulesFamilyImpl::getConstantBufferRules(CompilerOptionSet&, Type*)
+LayoutRulesImpl* HLSLLayoutRulesFamilyImpl::getConstantBufferRules(
+    CompilerOptionSet&,
+    Type* containerType)
 {
+    if (isStd140ConstantBufferType(containerType))
+        return &kHLSLStd140ConstantBufferLayoutRulesImpl_;
     return &kHLSLConstantBufferLayoutRulesImpl_;
 }
 
@@ -2208,8 +2276,12 @@ LayoutRulesImpl* HLSLLayoutRulesFamilyImpl::getEntryPointParameterRules()
     return &kHLSLConstantBufferLayoutRulesImpl_;
 }
 
-LayoutRulesImpl* HLSLLayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&)
+LayoutRulesImpl* HLSLLayoutRulesFamilyImpl::getStructuredBufferRules(
+    CompilerOptionSet&,
+    Type* containerType)
 {
+    if (isStd430StructuredBufferType(containerType))
+        return &kHLSLStd430StructuredBufferLayoutRulesImpl_;
     return &kHLSLStructuredBufferLayoutRulesImpl_;
 }
 
@@ -2319,7 +2391,7 @@ LayoutRulesImpl* CPULayoutRulesFamilyImpl::getEntryPointParameterRules()
     return &kCPULayoutRulesImpl_;
 }
 
-LayoutRulesImpl* CPULayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&)
+LayoutRulesImpl* CPULayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&, Type*)
 {
     return &kCPULayoutRulesImpl_;
 }
@@ -2441,7 +2513,8 @@ LayoutRulesImpl* LLVMLayoutRulesFamilyImpl::getEntryPointParameterRules()
 }
 
 LayoutRulesImpl* LLVMLayoutRulesFamilyImpl::getStructuredBufferRules(
-    CompilerOptionSet& compilerOptions)
+    CompilerOptionSet& compilerOptions,
+    Type*)
 {
     if (compilerOptions.shouldUseScalarLayout())
         return &kLLVMScalarLayoutRulesImpl_;
@@ -2515,7 +2588,7 @@ LayoutRulesImpl* CLayoutRulesFamilyImpl::getEntryPointParameterRules()
     return &kCLayoutRulesImpl_;
 }
 
-LayoutRulesImpl* CLayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&)
+LayoutRulesImpl* CLayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&, Type*)
 {
     return &kCLayoutRulesImpl_;
 }
@@ -2587,7 +2660,7 @@ LayoutRulesImpl* CUDALayoutRulesFamilyImpl::getEntryPointParameterRules()
     return &kCUDAEntryPointParameterLayoutRulesImpl_;
 }
 
-LayoutRulesImpl* CUDALayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&)
+LayoutRulesImpl* CUDALayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&, Type*)
 {
     return &kCUDALayoutRulesImpl_;
 }
@@ -2755,6 +2828,22 @@ LayoutRulesImpl kMetalConstantBufferLayoutRulesImpl_ = {
     &kMetalObjectLayoutRulesImpl,
 };
 
+// A `ConstantBuffer<T, Std140DataLayout>` keeps the std140 layout on Metal targets;
+// buffer element lowering stores its vectors packed and inserts padding members.
+LayoutRulesImpl kMetalStd140ConstantBufferLayoutRulesImpl_ = {
+    &kMetalLayoutRulesFamilyImpl,
+    &kStd140LayoutRulesImpl,
+    &kMetalObjectLayoutRulesImpl,
+};
+
+// A `StructuredBuffer<T, Std430DataLayout>` keeps the std430 layout on Metal targets,
+// in the same way.
+LayoutRulesImpl kMetalStd430StructuredBufferLayoutRulesImpl_ = {
+    &kMetalLayoutRulesFamilyImpl,
+    &kStd430LayoutRulesImpl,
+    &kMetalObjectLayoutRulesImpl,
+};
+
 LayoutRulesImpl kMetalParameterBlockLayoutRulesImpl_ = {
     &kMetalLayoutRulesFamilyImpl,
     &kMetalArgumentBufferElementLayoutRulesImpl,
@@ -2764,6 +2853,12 @@ LayoutRulesImpl kMetalParameterBlockLayoutRulesImpl_ = {
 LayoutRulesImpl kMetalTier2ConstantBufferLayoutRulesImpl_ = {
     &kMetalLayoutRulesFamilyImpl,
     &kMetalLayoutRulesImpl,
+    &kMetalTier2ObjectLayoutRulesImpl,
+};
+
+LayoutRulesImpl kMetalTier2Std140ConstantBufferLayoutRulesImpl_ = {
+    &kMetalLayoutRulesFamilyImpl,
+    &kStd140LayoutRulesImpl,
     &kMetalTier2ObjectLayoutRulesImpl,
 };
 
@@ -2796,8 +2891,12 @@ LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getAnyValueRules()
     return &kHLSLAnyValueLayoutRulesImpl_;
 }
 
-LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getConstantBufferRules(CompilerOptionSet&, Type*)
+LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getConstantBufferRules(
+    CompilerOptionSet&,
+    Type* containerType)
 {
+    if (isStd140ConstantBufferType(containerType))
+        return &kMetalStd140ConstantBufferLayoutRulesImpl_;
     return &kMetalConstantBufferLayoutRulesImpl_;
 }
 
@@ -2821,8 +2920,12 @@ LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getEntryPointParameterRules()
     return &kMetalConstantBufferLayoutRulesImpl_;
 }
 
-LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&)
+LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getStructuredBufferRules(
+    CompilerOptionSet&,
+    Type* containerType)
 {
+    if (isStd430StructuredBufferType(containerType))
+        return &kMetalStd430StructuredBufferLayoutRulesImpl_;
     return &kMetalStructuredBufferLayoutRulesImpl_;
 }
 
@@ -2868,8 +2971,10 @@ LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getHitAttributesParameterRules()
 
 LayoutRulesImpl* MetalArgumentBufferTier2LayoutRulesFamilyImpl::getConstantBufferRules(
     CompilerOptionSet&,
-    Type*)
+    Type* containerType)
 {
+    if (isStd140ConstantBufferType(containerType))
+        return &kMetalTier2Std140ConstantBufferLayoutRulesImpl_;
     return &kMetalTier2ConstantBufferLayoutRulesImpl_;
 }
 
@@ -2964,7 +3069,7 @@ LayoutRulesImpl* WGSLLayoutRulesFamilyImpl::getHitAttributesParameterRules()
     return &kGLSLHitAttributesParameterLayoutRulesImpl_;
 }
 
-LayoutRulesImpl* WGSLLayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&)
+LayoutRulesImpl* WGSLLayoutRulesFamilyImpl::getStructuredBufferRules(CompilerOptionSet&, Type*)
 {
     return &kGLSLStructuredBufferLayoutRulesImpl_;
 }
@@ -3076,7 +3181,8 @@ TypeLayoutContext getInitialLayoutContextForTarget(
         switch (rules)
         {
         case slang::LayoutRules::DefaultStructuredBuffer:
-            context.rules = rulesFamily->getStructuredBufferRules(targetReq->getOptionSet());
+            context.rules =
+                rulesFamily->getStructuredBufferRules(targetReq->getOptionSet(), nullptr);
             break;
         default:
             context.rules = rulesFamily->getConstantBufferRules(targetReq->getOptionSet(), nullptr);
@@ -4393,8 +4499,9 @@ RefPtr<StructuredBufferTypeLayout> createStructuredBufferWithCounterTypeLayout(
     auto typeLayout =
         createStructuredBufferTypeLayout(context, kind, structuredBufferType, elementTypeLayout);
 
-    const auto structuredBufferLayoutRules =
-        context.getRulesFamily()->getStructuredBufferRules(context.targetReq->getOptionSet());
+    const auto structuredBufferLayoutRules = context.getRulesFamily()->getStructuredBufferRules(
+        context.targetReq->getOptionSet(),
+        structuredBufferType);
 
     const auto counterType = context.astBuilder->getIntType();
     const auto counterBufferType = context.astBuilder->getRWStructuredBufferType(counterType);
@@ -4530,8 +4637,9 @@ RefPtr<StructuredBufferTypeLayout> createStructuredBufferTypeLayout(
     Type* elementType)
 {
     // look up the appropriate rules via the `LayoutRulesFamily`
-    auto structuredBufferLayoutRules =
-        context.getRulesFamily()->getStructuredBufferRules(context.targetReq->getOptionSet());
+    auto structuredBufferLayoutRules = context.getRulesFamily()->getStructuredBufferRules(
+        context.targetReq->getOptionSet(),
+        structuredBufferType);
 
     // Create and save type layout for the buffer contents.
     auto elementTypeLayout =

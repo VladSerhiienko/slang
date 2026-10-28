@@ -1491,7 +1491,11 @@ struct LayoutRulesFamilyImpl
 
     virtual LayoutRulesImpl* getEntryPointParameterRules() = 0;
 
-    virtual LayoutRulesImpl* getStructuredBufferRules(CompilerOptionSet& compilerOptions) = 0;
+    /// Rules for the elements of the structured buffer type `containerType` (null when
+    /// no particular buffer type is known).
+    virtual LayoutRulesImpl* getStructuredBufferRules(
+        CompilerOptionSet& compilerOptions,
+        Type* containerType) = 0;
 };
 
 /// A custom tuple to capture the outputs of type layout

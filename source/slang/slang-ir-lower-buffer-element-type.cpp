@@ -334,6 +334,32 @@ struct BufferElementTypeLoweringPolicy : public RefObject
     /// SPIRV.
     virtual bool canUseStorageTypeInLocalVar() { return true; }
 
+    /// Returns the rules the target language applies to the members of a storage struct
+    /// lowered with `config` when the emitted code cannot state member offsets, or null when
+    /// it can (SPIR-V `Offset` decorations, WGSL `@align` attributes). A non-null result makes
+    /// struct lowering insert padding members so that every member lands on the offset that
+    /// `config`'s layout rule assigns it, and the struct ends at that rule's size.
+    ///
+    /// Consider `ConstantBuffer<S, Std140DataLayout>` with `struct S { float a; float3 b; }`
+    /// on HLSL. FXC packs `b` at offset 4 because it fits in the first register, while
+    /// std140 aligns it to 16. The storage struct therefore becomes
+    /// `{ float a; uint _padding[3 members]; float3 b; uint _padding; }`, which FXC packs
+    /// with `b` at 16 and a total size of 32, as std140 requires.
+    virtual IRTypeLayoutRules* getNativeStorageLayoutRules(TypeLoweringConfig config)
+    {
+        SLANG_UNUSED(config);
+        return nullptr;
+    }
+
+    /// Returns true if this policy lowers the element type of a buffer laid out with `config`.
+    /// A policy that only rewrites one kind of buffer declines the others, so that a later
+    /// invocation of the pass with another policy still lowers them.
+    virtual bool shouldLowerBuffer(TypeLoweringConfig config)
+    {
+        SLANG_UNUSED(config);
+        return true;
+    }
+
     /// Discovery filter: returns true if the given buffer element type
     /// may contain fields that this policy wants to lower.
     ///
@@ -456,6 +482,90 @@ void maybeAddPhysicalTypeDecoration(IRBuilder& builder, IRInst* type, TypeLoweri
     if (config.lowerToPhysicalType)
         builder.addPhysicalTypeDecoration(type);
 }
+
+/// Adds padding members to a storage struct so that a target language packing it with
+/// `nativeRules` places every member on the offset of an explicit layout rule.
+///
+/// The padder tracks where the members added so far end under `nativeRules`. Before a member
+/// is added at its explicit offset, `padTo` appends `uint` members until they end exactly at
+/// that offset, and then checks that the native rules place the member there. This only
+/// works if the explicit rule places every member at or after the end of the previous one,
+/// on an offset the native rules accept for that member without moving it. Std140 satisfies
+/// this against FXC constant-buffer packing, and against Metal when vectors are stored
+/// packed. Any other shape is reported as an internal error rather than being emitted with a
+/// silently different layout.
+struct StorageStructPadder
+{
+    TargetRequest* targetReq;
+    /// Null when the target states member offsets itself; the padder is then inactive.
+    IRTypeLayoutRules* nativeRules;
+    IRBuilder& builder;
+    IRStructType* structType;
+
+    IRIntegerValue nativeOffset = 0;
+    IRType* lastFieldType = nullptr;
+    IRIntegerValue lastFieldAlignment = 0;
+
+    StorageStructPadder(
+        TargetRequest* inTargetReq,
+        IRTypeLayoutRules* inNativeRules,
+        IRBuilder& inBuilder,
+        IRStructType* inStructType)
+        : targetReq(inTargetReq)
+        , nativeRules(inNativeRules)
+        , builder(inBuilder)
+        , structType(inStructType)
+    {
+    }
+
+    IRSizeAndAlignment getNativeLayout(IRType* type)
+    {
+        IRSizeAndAlignment layout;
+        if (SLANG_FAILED(getSizeAndAlignment(targetReq, nativeRules, type, &layout)))
+            SLANG_UNEXPECTED("explicit buffer layout needs a known native member size");
+        return layout;
+    }
+
+    /// Return the offset at which the native rules place a member with `layout` next.
+    IRIntegerValue getNativePlacement(IRSizeAndAlignment layout)
+    {
+        auto offset =
+            nativeRules->adjustOffset(nativeOffset, layout.size, lastFieldType, lastFieldAlignment);
+        return align(offset, layout.alignment);
+    }
+
+    /// Append padding members that end at `offset`, where a member of `type` is added next.
+    /// A null `type` pads the end of the struct, so that its native size becomes `offset`.
+    void padTo(IRIntegerValue offset, IRType* type)
+    {
+        auto padType = builder.getUIntType();
+        auto padLayout = getNativeLayout(padType);
+        while (nativeOffset < offset)
+        {
+            if (offset - nativeOffset < padLayout.size ||
+                getNativePlacement(padLayout) != nativeOffset)
+            {
+                SLANG_UNEXPECTED("explicit buffer layout cannot be expressed with padding members");
+            }
+            auto key = builder.createStructKey();
+            builder.addNameHintDecoration(key, UnownedStringSlice("_padding"));
+            builder.createStructField(structType, key, padType);
+            advancePast(padType);
+        }
+        IRIntegerValue placement = type ? getNativePlacement(getNativeLayout(type)) : nativeOffset;
+        if (placement != offset)
+            SLANG_UNEXPECTED("explicit buffer layout cannot be expressed with padding members");
+    }
+
+    /// Record that a member of `type` was added at its native placement.
+    void advancePast(IRType* type)
+    {
+        auto layout = getNativeLayout(type);
+        nativeOffset = getNativePlacement(layout) + layout.size;
+        lastFieldType = type;
+        lastFieldAlignment = layout.alignment;
+    }
+};
 
 struct LoweredElementTypeContext
 {
@@ -648,6 +758,143 @@ struct LoweredElementTypeContext
         return func;
     }
 
+    static IRType* getVectorElementType(IRType* type)
+    {
+        if (auto vectorType = as<IRVectorType>(type))
+            return vectorType->getElementType();
+        if (auto packedType = as<IRMetalPackedVectorType>(type))
+            return packedType->getElementType();
+        return type;
+    }
+
+    static IRIntegerValue getVectorElementCount(IRType* type)
+    {
+        if (auto vectorType = as<IRVectorType>(type))
+            return getIntVal(vectorType->getElementCount());
+        if (auto packedType = as<IRMetalPackedVectorType>(type))
+            return getIntVal(packedType->getElementCount());
+        return 1;
+    }
+
+    /// Return the scalar or vector type that holds an array element stored with a different
+    /// scalar type than its logical type (for example a `bool3` stored as `packed_uint3` on
+    /// Metal is held in a `uint3`), or null when the element keeps its logical scalar type.
+    static IRType* getStorageCastNarrowType(
+        IRBuilder& builder,
+        const LoweredElementTypeInfo& elementInfo)
+    {
+        auto loweredElementType = getVectorElementType(elementInfo.loweredType);
+        auto originalElementType = getVectorElementType(elementInfo.originalType);
+        if (!as<IRBasicType>(loweredElementType) || !as<IRBasicType>(originalElementType) ||
+            loweredElementType == originalElementType)
+            return nullptr;
+        if (as<IRVectorType>(elementInfo.originalType))
+            return builder.getVectorType(
+                loweredElementType,
+                getVectorElementCount(elementInfo.originalType));
+        return loweredElementType;
+    }
+
+    /// Return a [ForceInline] function that reads an array element stored in the leading
+    /// components of `wideType` and casts it to `originalType`:
+    /// `bool unpackStorage(ref uint4 p) { return bool(uint(p)); }`
+    IRFunc* createWidenedCastUnpackFunc(
+        IRType* originalType,
+        IRType* narrowType,
+        IRVectorType* wideType)
+    {
+        IRBuilder builder(wideType);
+        builder.setInsertAfter(wideType);
+        auto func = builder.createFunc();
+        auto refWideType = builder.getRefParamType(wideType, AddressSpace::Generic);
+        func->setFullType(builder.getFuncType(1, (IRType**)&refWideType, originalType));
+        builder.addNameHintDecoration(func, UnownedStringSlice("unpackStorage"));
+        builder.addForceInlineDecoration(func);
+        builder.setInsertInto(func);
+        builder.emitBlock();
+        IRInst* wide = builder.emitLoad(builder.emitParam(refWideType));
+        auto narrow = builder.emitIntrinsicInst(narrowType, kIROp_VectorReshape, 1, &wide);
+        builder.emitReturn(builder.emitCast(originalType, narrow));
+        return func;
+    }
+
+    /// Return a [ForceInline] function that casts an `originalType` array element to its
+    /// storage scalar type and writes it to the leading components of `wideType`:
+    /// `void packStorage(out uint4 p, bool v) { p = uint4(uint(v)); }`
+    IRFunc* createWidenedCastPackFunc(
+        IRType* originalType,
+        IRType* narrowType,
+        IRVectorType* wideType)
+    {
+        IRBuilder builder(wideType);
+        builder.setInsertAfter(wideType);
+        auto func = builder.createFunc();
+        auto outWideType = builder.getRefParamType(wideType, AddressSpace::Generic);
+        IRType* paramTypes[] = {outWideType, originalType};
+        func->setFullType(builder.getFuncType(2, paramTypes, builder.getVoidType()));
+        builder.addNameHintDecoration(func, UnownedStringSlice("packStorage"));
+        builder.addForceInlineDecoration(func);
+        builder.setInsertInto(func);
+        builder.emitBlock();
+        auto outParam = builder.emitParam(outWideType);
+        auto originalParam = builder.emitParam(originalType);
+        IRInst* narrow = builder.emitCast(narrowType, originalParam);
+        auto wideOp =
+            as<IRVectorType>(narrowType) ? kIROp_VectorReshape : kIROp_MakeVectorFromScalar;
+        builder.emitStore(outParam, builder.emitIntrinsicInst(wideType, wideOp, 1, &narrow));
+        builder.emitReturn();
+        return func;
+    }
+
+    /// Return the size and stride-aligned layout of `type` under `rules`, as an element of an
+    /// array or buffer.
+    IRSizeAndAlignment getElementLayout(IRTypeLayoutRules* rules, IRType* type)
+    {
+        IRSizeAndAlignment layout;
+        if (SLANG_FAILED(getSizeAndAlignment(target->getTargetReq(), rules, type, &layout)))
+            SLANG_UNEXPECTED("explicit buffer layout needs a known element size");
+        return rules->alignCompositeElement(layout);
+    }
+
+    /// Return the number of components of the vector that stores a scalar or vector array
+    /// element described by `elementInfo`, or zero to keep the element as it is.
+    ///
+    /// A std140 constant buffer on a target that requires 16-byte array strides
+    /// (`shouldTranslateArrayElementTo16ByteAlignedVectorForConstantBuffer`) widens every
+    /// scalar and vector element to 16 bytes. On a target whose storage structs are packed
+    /// with native rules (`getNativeStorageLayoutRules`), an element is widened only when its
+    /// native stride differs from the stride of the explicit layout. Consider
+    /// `StructuredBuffer<S, Std430DataLayout>` with `struct S { float3 v[2]; }` on HLSL: std430
+    /// gives `v` a 16-byte stride but HLSL packs `float3` in 12 bytes, so `v` is stored as
+    /// `float4[2]`.
+    IRIntegerValue getWidenedArrayElementCount(
+        const LoweredElementTypeInfo& elementInfo,
+        TypeLoweringConfig config)
+    {
+        auto storedType = elementInfo.loweredType;
+        auto scalarType = as<IRBasicType>(getVectorElementType(storedType));
+        if (!scalarType)
+            return 0;
+        auto count = getVectorElementCount(storedType);
+        if (config.layoutRuleName == IRTypeLayoutRuleName::Std140 &&
+            leafTypeLoweringPolicy
+                ->shouldTranslateArrayElementTo16ByteAlignedVectorForConstantBuffer())
+        {
+            return get16ByteAlignedVectorElementCount(target, scalarType, count);
+        }
+        auto nativeRules = leafTypeLoweringPolicy->getNativeStorageLayoutRules(config);
+        if (!nativeRules)
+            return 0;
+        auto stride =
+            getElementLayout(config.getLayoutRule(), elementInfo.originalType).getStride();
+        if (stride == getElementLayout(nativeRules, storedType).getStride())
+            return 0;
+        auto scalarSize = getElementLayout(nativeRules, scalarType).size;
+        if (scalarSize == 0 || stride % scalarSize != 0 || stride / scalarSize < count)
+            SLANG_UNEXPECTED("explicit buffer layout cannot be expressed for an array element");
+        return stride / scalarSize;
+    }
+
     LoweredElementTypeInfo getLoweredTypeInfoImpl(IRType* type, TypeLoweringConfig config)
     {
         IRBuilder builder(type);
@@ -659,24 +906,47 @@ struct LoweredElementTypeContext
         {
             auto loweredInnerTypeInfo = getLoweredTypeInfo(arrayTypeBase->getElementType(), config);
 
-            if (config.layoutRuleName == IRTypeLayoutRuleName::Std140 &&
-                leafTypeLoweringPolicy
-                    ->shouldTranslateArrayElementTo16ByteAlignedVectorForConstantBuffer())
+            if (auto widenedCount = getWidenedArrayElementCount(loweredInnerTypeInfo, config))
             {
-                // For constant buffer layout, we need to use 16-byte-aligned vector if
-                // we are required to ensure array element types has 16-byte stride.
+                // Some layouts need array elements stored in wider vectors: a std140 constant
+                // buffer on a target that requires 16-byte array strides, or an explicit layout
+                // whose element stride differs from the target's native one (a std430 `float3`
+                // element has a 16-byte stride but packs in 12 bytes on HLSL).
                 // We only need to handle the case where the element type is a scalar or vector
                 // type here, because if the element type is a matrix type or struct type,
                 // the size promotion will be handled during lowering of the element type.
                 IRType* packedVectorType = nullptr;
-                if (auto vectorType = as<IRVectorType>(loweredInnerTypeInfo.loweredType))
+                if (auto packedType = as<IRMetalPackedVectorType>(loweredInnerTypeInfo.loweredType);
+                    packedType && packedType->getElementType() ==
+                                      getVectorElementType(loweredInnerTypeInfo.originalType))
                 {
-                    packedVectorType = builder.getVectorType(
-                        vectorType->getElementType(),
-                        builder.getIntValue(get16ByteAlignedVectorElementCount(
-                            target,
-                            vectorType->getElementType(),
-                            getIntVal(vectorType->getElementCount()))));
+                    // A packed vector element (Metal) is widened like the logical vector it
+                    // stores: the 16-byte vector replaces the packed storage.
+                    loweredInnerTypeInfo.loweredType = loweredInnerTypeInfo.originalType;
+                    loweredInnerTypeInfo.convertLoweredToOriginal = ConversionMethod();
+                    loweredInnerTypeInfo.convertOriginalToLowered = ConversionMethod();
+                }
+                if (auto narrowType = getStorageCastNarrowType(builder, loweredInnerTypeInfo))
+                {
+                    // The element is stored with a different scalar type (Metal stores `bool`
+                    // as `uint`), so the widened vector holds that storage type and the
+                    // conversions cast through the narrow storage value.
+                    auto wideType =
+                        builder.getVectorType(getVectorElementType(narrowType), widenedCount);
+                    packedVectorType = wideType;
+                    loweredInnerTypeInfo.convertLoweredToOriginal = createWidenedCastUnpackFunc(
+                        loweredInnerTypeInfo.originalType,
+                        narrowType,
+                        wideType);
+                    loweredInnerTypeInfo.convertOriginalToLowered = createWidenedCastPackFunc(
+                        loweredInnerTypeInfo.originalType,
+                        narrowType,
+                        wideType);
+                }
+                else if (auto vectorType = as<IRVectorType>(loweredInnerTypeInfo.loweredType))
+                {
+                    packedVectorType =
+                        builder.getVectorType(vectorType->getElementType(), widenedCount);
                     if (packedVectorType != loweredInnerTypeInfo.originalType)
                     {
                         loweredInnerTypeInfo.convertLoweredToOriginal = kIROp_VectorReshape;
@@ -685,9 +955,9 @@ struct LoweredElementTypeContext
                 }
                 else if (auto scalarType = as<IRBasicType>(loweredInnerTypeInfo.loweredType))
                 {
-                    packedVectorType = builder.getVectorType(
-                        loweredInnerTypeInfo.loweredType,
-                        get16ByteAlignedVectorElementCount(target, scalarType, 1));
+                    SLANG_UNUSED(scalarType);
+                    packedVectorType =
+                        builder.getVectorType(loweredInnerTypeInfo.loweredType, widenedCount);
                     loweredInnerTypeInfo.convertLoweredToOriginal = kIROp_VectorReshape;
                     loweredInnerTypeInfo.convertOriginalToLowered = kIROp_MakeVectorFromScalar;
                 }
@@ -820,6 +1090,11 @@ struct LoweredElementTypeContext
             info.loweredType = loweredType;
             // Create fields.
             {
+                StorageStructPadder padder(
+                    target->getTargetReq(),
+                    leafTypeLoweringPolicy->getNativeStorageLayoutRules(config),
+                    builder,
+                    loweredType);
                 Index fieldId = 0;
                 for (auto field : structType->getFields())
                 {
@@ -832,11 +1107,41 @@ struct LoweredElementTypeContext
                         loweredFieldTypeInfo.loweredType = builder.getVoidType();
                         continue;
                     }
+                    if (padder.nativeRules)
+                    {
+                        IRIntegerValue offset = 0;
+                        if (SLANG_FAILED(getOffset(
+                                target->getTargetReq(),
+                                config.getLayoutRule(),
+                                field,
+                                &offset)))
+                        {
+                            SLANG_UNEXPECTED("explicit buffer layout needs a known member offset");
+                        }
+                        padder.padTo(offset, loweredFieldTypeInfo.loweredType);
+                    }
                     builder.createStructField(
                         loweredType,
                         field->getKey(),
                         loweredFieldTypeInfo.loweredType);
+                    if (padder.nativeRules)
+                        padder.advancePast(loweredFieldTypeInfo.loweredType);
                     fieldId++;
+                }
+                if (padder.nativeRules)
+                {
+                    IRSizeAndAlignment structLayout;
+                    if (SLANG_FAILED(getSizeAndAlignment(
+                            target->getTargetReq(),
+                            config.getLayoutRule(),
+                            structType,
+                            &structLayout)))
+                    {
+                        SLANG_UNEXPECTED("explicit buffer layout needs a known struct size");
+                    }
+                    // Arrays and buffers step by the stride, which std430 does not fold
+                    // into the struct size, so the storage struct ends at the stride.
+                    padder.padTo(structLayout.getStride(), nullptr);
                 }
             }
 
@@ -1773,6 +2078,21 @@ struct LoweredElementTypeContext
                 elementType = structBuffer->getElementType();
                 auto config = getTypeLoweringConfigForBuffer(target, structBuffer);
 
+                // A scalar or vector element keeps its native stride: element lowering cannot
+                // widen it without widening every field of the same type. Consider
+                // `StructuredBuffer<float3, Std430DataLayout>` on HLSL, whose std430 stride is
+                // 16 while HLSL packs `float3` elements every 12 bytes; a struct element
+                // (`struct E { float3 v; }`) is padded to the std430 stride instead.
+                if (auto nativeRules = leafTypeLoweringPolicy->getNativeStorageLayoutRules(config);
+                    nativeRules && as<IRBasicType>(getVectorElementType(elementType)) &&
+                    getElementLayout(config.getLayoutRule(), elementType).getStride() !=
+                        getElementLayout(nativeRules, elementType).getStride())
+                {
+                    SLANG_UNEXPECTED(
+                        "this structured buffer element has a different stride under its "
+                        "explicit data layout on this target; wrap the element in a struct");
+                }
+
                 // Create size and alignment decoration for potential use
                 // in`StructuredBufferGetDimensions`.
                 IRSizeAndAlignment sizeAlignment;
@@ -1827,6 +2147,8 @@ struct LoweredElementTypeContext
                 continue;
 
             auto config = getTypeLoweringConfigForBuffer(target, bufferType);
+            if (!leafTypeLoweringPolicy->shouldLowerBuffer(config))
+                continue;
             auto loweredBufferElementTypeInfo = getLoweredTypeInfo(elementType, config);
 
             // If the lowered type is the same as original type, no change is required.
@@ -2404,6 +2726,26 @@ static IRTypeLayoutRuleName getTypeLayoutRuleNameFromOpAlways(
     return getTypeLayoutRuleNameFromOp(layoutTypeOp, defaultLayout).value_or(defaultLayout);
 }
 
+/// Return true if `bufferType` is a `ConstantBuffer<T, Std140DataLayout>`.
+static bool isStd140ConstantBufferType(IRType* bufferType)
+{
+    if (bufferType->getOp() != kIROp_ConstantBufferType)
+        return false;
+    auto dataLayout = cast<IRUniformParameterGroupType>(bufferType)->getDataLayout();
+    return dataLayout && dataLayout->getOp() == kIROp_Std140BufferLayoutType;
+}
+
+/// Return true if `bufferType` is a `StructuredBuffer<T, Std430DataLayout>` or one of its
+/// read-write, append, consume or rasterizer-ordered variants.
+static bool isStd430StructuredBufferType(IRType* bufferType)
+{
+    auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(bufferType);
+    if (!structuredBufferType)
+        return false;
+    auto dataLayout = structuredBufferType->getDataLayout();
+    return dataLayout && dataLayout->getOp() == kIROp_Std430BufferLayoutType;
+}
+
 IRTypeLayoutRuleName getTypeLayoutRuleNameForBuffer(TargetProgram* target, IRType* bufferType)
 {
     if (bufferType->getOp() == kIROp_ParameterBlockType && isMetalTarget(target->getTargetReq()))
@@ -2411,6 +2753,20 @@ IRTypeLayoutRuleName getTypeLayoutRuleNameForBuffer(TargetProgram* target, IRTyp
         return IRTypeLayoutRuleName::MetalParameterBlock;
     }
     auto targetReq = target->getTargetReq();
+
+    // A `ConstantBuffer<T, Std140DataLayout>` has the std140 layout, and a
+    // `StructuredBuffer<T, Std430DataLayout>` the std430 layout, on every target that accepts
+    // the layout type, matching the type layout reflection reports for them. HLSL and Metal
+    // cannot state member offsets, so their policies reproduce the layout with padding
+    // members (see `getNativeStorageLayoutRules`). Khronos and WGSL targets reach the same
+    // rule below through the explicit data layout.
+    if (isD3DTarget(targetReq) || isMetalTarget(targetReq))
+    {
+        if (isStd140ConstantBufferType(bufferType))
+            return IRTypeLayoutRuleName::Std140;
+        if (isStd430StructuredBufferType(bufferType))
+            return IRTypeLayoutRuleName::Std430;
+    }
     if (targetReq->getTarget() != CodeGenTarget::WGSL)
     {
         if (!isKhronosTarget(target->getTargetReq()) && !isCPUTargetViaLLVM(targetReq))
@@ -2626,6 +2982,64 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
         return true;
     }
 
+    virtual IRTypeLayoutRules* getNativeStorageLayoutRules(TypeLoweringConfig config) override
+    {
+        if (!isD3DTarget(target->getTargetReq()))
+            return nullptr;
+        // FXC packs every HLSL constant buffer with its own rules, so a std140 constant
+        // buffer (`ConstantBuffer<T, Std140DataLayout>`) needs padding members.
+        if (config.addressSpace == AddressSpace::Uniform &&
+            config.layoutRuleName == IRTypeLayoutRuleName::Std140)
+        {
+            return IRTypeLayoutRules::getConstantBuffer();
+        }
+        // HLSL structured buffers pack members with their scalar alignment, so a std430
+        // structured buffer (`StructuredBuffer<T, Std430DataLayout>`) needs padding members.
+        if (config.addressSpace == AddressSpace::StorageBuffer &&
+            config.layoutRuleName == IRTypeLayoutRuleName::Std430)
+        {
+            return IRTypeLayoutRules::getNatural();
+        }
+        return nullptr;
+    }
+
+    /// Return the component count of the vectors that store a matrix's columns (or rows)
+    /// on a target whose storage structs are packed with native rules, or `count` when the
+    /// native stride already matches. A std430 `float3x3` steps 16 bytes per `float3`
+    /// column, which HLSL packs in 12, so its columns are stored as `float4`.
+    IRIntegerValue getNativeMatrixVectorCount(
+        IRType* elementType,
+        IRIntegerValue count,
+        TypeLoweringConfig config)
+    {
+        auto nativeRules = getNativeStorageLayoutRules(config);
+        if (!nativeRules)
+            return count;
+        IRBuilder builder(elementType);
+        auto vectorType = builder.getVectorType(elementType, count);
+        IRSizeAndAlignment logical;
+        IRSizeAndAlignment native;
+        IRSizeAndAlignment scalar;
+        if (SLANG_FAILED(getSizeAndAlignment(
+                target->getTargetReq(),
+                config.getLayoutRule(),
+                vectorType,
+                &logical)) ||
+            SLANG_FAILED(
+                getSizeAndAlignment(target->getTargetReq(), nativeRules, vectorType, &native)) ||
+            SLANG_FAILED(
+                getSizeAndAlignment(target->getTargetReq(), nativeRules, elementType, &scalar)))
+        {
+            SLANG_UNEXPECTED("explicit buffer layout needs a known matrix vector size");
+        }
+        auto stride = config.getLayoutRule()->alignCompositeElement(logical).getStride();
+        if (stride == nativeRules->alignCompositeElement(native).getStride())
+            return count;
+        if (scalar.size == 0 || stride % scalar.size != 0 || stride / scalar.size < count)
+            SLANG_UNEXPECTED("explicit buffer layout cannot be expressed for a matrix");
+        return stride / scalar.size;
+    }
+
     IRFunc* createMatrixUnpackFunc(
         IRMatrixType* matrixType,
         IRStructType* structType,
@@ -2810,6 +3224,13 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                     target,
                     matrixType->getElementType(),
                     getIntVal(vectorSize)));
+            }
+            else
+            {
+                vectorSize = builder.getIntValue(getNativeMatrixVectorCount(
+                    matrixType->getElementType(),
+                    getIntVal(vectorSize),
+                    config));
             }
 
             auto vectorType = builder.getVectorType(matrixType->getElementType(), vectorSize);
@@ -3003,12 +3424,15 @@ struct MetalBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLoweringPo
     }
 
     // Decide whether a buffer with this config uses packed vector storage.
-    // Only device-memory buffers laid out with natural rules do: constant
-    // and argument buffers (Uniform address space) keep the native MSL
-    // layout reflection reports, and an explicit non-natural data layout
-    // (e.g. `Std140DataLayout`) opts out via the rule-name check.
+    // Device-memory buffers laid out with natural rules do, and so do buffers
+    // with an explicit std140/std430 layout (`isExplicitLayoutStorage`): both
+    // place a scalar right after a `float3`, which a native 16-byte MSL
+    // `float3` cannot express. Other constant and argument buffers (Uniform
+    // address space) keep the native MSL layout that reflection reports.
     bool usesPackedVectorStorage(TypeLoweringConfig config)
     {
+        if (isExplicitLayoutStorage(config))
+            return true;
         if (config.layoutRuleName != IRTypeLayoutRuleName::Natural)
             return false;
         switch (config.addressSpace)
@@ -3019,6 +3443,36 @@ struct MetalBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLoweringPo
         default:
             return false;
         }
+    }
+
+    // `getTypeLayoutRuleNameForBuffer` assigns the std140 rule on Metal only to
+    // std140 constant buffers (`ConstantBuffer<T, Std140DataLayout>`), and the
+    // std430 rule only to std430 structured buffers
+    // (`StructuredBuffer<T, Std430DataLayout>`).
+    static bool isExplicitLayoutStorage(TypeLoweringConfig config)
+    {
+        return (config.addressSpace == AddressSpace::Uniform &&
+                config.layoutRuleName == IRTypeLayoutRuleName::Std140) ||
+               (config.addressSpace == AddressSpace::StorageBuffer &&
+                config.layoutRuleName == IRTypeLayoutRuleName::Std430);
+    }
+
+    // Std140 requires a 16-byte stride for arrays of scalars and vectors, and
+    // for the column (or row) vectors of a matrix.
+    virtual bool shouldTranslateArrayElementTo16ByteAlignedVectorForConstantBuffer() override
+    {
+        return true;
+    }
+
+    // With every vector stored packed, MSL lays an explicit-layout storage
+    // struct out with natural rules: packed vectors, scalars and `uint`
+    // padding are 4-byte aligned, and the wider vectors of arrays and matrices
+    // only ever sit on offsets aligned to their native MSL alignment.
+    virtual IRTypeLayoutRules* getNativeStorageLayoutRules(TypeLoweringConfig config) override
+    {
+        if (isExplicitLayoutStorage(config))
+            return IRTypeLayoutRules::getNatural();
+        return nullptr;
     }
 
     // The single classification deciding whether a vector uses packed storage,
@@ -3263,6 +3717,91 @@ struct MetalBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLoweringPo
         return func;
     }
 
+    // Return a [ForceInline] function that converts a packed `uint` vector
+    // (by address) to the logical `bool` vector it stores:
+    // `bool3 unpackBool(ref packed_uint3 p) { return bool3(uint3(p)); }`
+    IRFunc* createBoolVectorUnpackFunc(
+        IRVectorType* boolVectorType,
+        IRMetalPackedVectorType* packedUintType)
+    {
+        IRBuilder builder(packedUintType);
+        builder.setInsertAfter(packedUintType);
+        auto func = builder.createFunc();
+        auto refPackedType = builder.getRefParamType(packedUintType, AddressSpace::Generic);
+        func->setFullType(builder.getFuncType(1, (IRType**)&refPackedType, boolVectorType));
+        builder.addNameHintDecoration(func, UnownedStringSlice("__unpackBoolVector"));
+        builder.addForceInlineDecoration(func);
+        builder.setInsertInto(func);
+        builder.emitBlock();
+
+        auto packedParam = builder.emitLoad(builder.emitParam(refPackedType));
+        auto uintVectorType = builder.getVectorType(
+            packedUintType->getElementType(),
+            packedUintType->getElementCount());
+        auto uintVector = builder.emitMakeVector(uintVectorType, 1, &packedParam);
+        builder.emitReturn(builder.emitCast(boolVectorType, uintVector));
+        return func;
+    }
+
+    // Return a [ForceInline] function that stores a logical `bool` vector as a
+    // packed `uint` vector (written through the out parameter):
+    // `void packBool(out packed_uint3 p, bool3 v) { p = packed_uint3(uint3(v)); }`
+    IRFunc* createBoolVectorPackFunc(
+        IRVectorType* boolVectorType,
+        IRMetalPackedVectorType* packedUintType)
+    {
+        IRBuilder builder(packedUintType);
+        builder.setInsertAfter(packedUintType);
+        auto func = builder.createFunc();
+        auto outPackedType = builder.getRefParamType(packedUintType, AddressSpace::Generic);
+        IRType* paramTypes[] = {outPackedType, boolVectorType};
+        func->setFullType(builder.getFuncType(2, paramTypes, builder.getVoidType()));
+        builder.addNameHintDecoration(func, UnownedStringSlice("__packBoolVector"));
+        builder.addForceInlineDecoration(func);
+        builder.setInsertInto(func);
+        builder.emitBlock();
+
+        auto outParam = builder.emitParam(outPackedType);
+        auto boolParam = builder.emitParam(boolVectorType);
+        auto uintVectorType = builder.getVectorType(
+            packedUintType->getElementType(),
+            packedUintType->getElementCount());
+        IRInst* uintVector = builder.emitCast(uintVectorType, boolParam);
+        builder.emitStore(outParam, builder.emitMakeVector(packedUintType, 1, &uintVector));
+        builder.emitReturn();
+        return func;
+    }
+
+    // MSL `bool` is a 1-byte type, while std140 and std430 give `bool` 4 bytes,
+    // so an explicit-layout buffer stores a `bool` as `uint` and a `bool`
+    // vector as a packed `uint` vector. Returns an info with a null lowered
+    // type for any other type.
+    LoweredElementTypeInfo lowerExplicitLayoutBoolType(IRType* type, TypeLoweringConfig config)
+    {
+        LoweredElementTypeInfo info = {};
+        info.originalType = type;
+        IRBuilder builder(type);
+        builder.setInsertAfter(type);
+        if (as<IRBoolType>(type))
+        {
+            info.loweredType = builder.getUIntType();
+            info.convertLoweredToOriginal = kIROp_BuiltinCast;
+            info.convertOriginalToLowered = kIROp_BuiltinCast;
+        }
+        else if (auto vectorType = as<IRVectorType>(type);
+                 vectorType && as<IRBoolType>(vectorType->getElementType()))
+        {
+            auto packedType = builder.getMetalPackedVectorType(
+                builder.getUIntType(),
+                vectorType->getElementCount());
+            maybeAddPhysicalTypeDecoration(builder, packedType, config);
+            info.loweredType = packedType;
+            info.convertLoweredToOriginal = createBoolVectorUnpackFunc(vectorType, packedType);
+            info.convertOriginalToLowered = createBoolVectorPackFunc(vectorType, packedType);
+        }
+        return info;
+    }
+
     LoweredElementTypeInfo lowerLeafLogicalType(IRType* type, TypeLoweringConfig config) override
     {
         // A bindless descriptor handle stored directly in a device-memory
@@ -3276,6 +3815,13 @@ struct MetalBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLoweringPo
             {
                 return lowerDescriptorHandleElement(handleType, config);
             }
+        }
+
+        if (isExplicitLayoutStorage(config))
+        {
+            auto boolInfo = lowerExplicitLayoutBoolType(type, config);
+            if (boolInfo.loweredType)
+                return boolInfo;
         }
 
         if (usesPackedVectorStorage(config))
@@ -3304,8 +3850,12 @@ struct MetalBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLoweringPo
                     return info;
                 }
             }
-            else if (auto matrixType = as<IRMatrixType>(type))
+            else if (auto matrixType = as<IRMatrixType>(type);
+                     matrixType && !isExplicitLayoutStorage(config))
             {
+                // Explicit-layout matrices step their columns (or rows) by the layout's
+                // vector stride, which the default policy lowers; packed rows only express
+                // natural layout.
                 bool isColMajor =
                     getIntVal(matrixType->getLayout()) == SLANG_MATRIX_LAYOUT_COLUMN_MAJOR;
                 auto minorCount = isColMajor ? getIntVal(matrixType->getRowCount())
@@ -3393,6 +3943,14 @@ struct MetalParameterBlockElementTypeLoweringPolicy : DefaultBufferElementTypeLo
         return false;
     }
 
+    // This pass only turns the resource fields of parameter blocks into descriptor
+    // handles. Constant buffers are lowered by the main Metal policy, which a storage
+    // struct created here (for example for a std140 constant buffer) would hide from it.
+    virtual bool shouldLowerBuffer(TypeLoweringConfig config) override
+    {
+        return config.layoutRuleName == IRTypeLayoutRuleName::MetalParameterBlock;
+    }
+
     LoweredElementTypeInfo lowerLeafLogicalType(IRType* type, TypeLoweringConfig config) override
     {
         if (config.layoutRuleName == IRTypeLayoutRuleName::MetalParameterBlock &&
@@ -3423,6 +3981,32 @@ struct WGSLBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLoweringPol
     virtual bool shouldTranslateArrayElementTo16ByteAlignedVectorForConstantBuffer() override
     {
         return true;
+    }
+
+    // WGSL `bool` is not host-shareable, so uniform and storage buffers hold a
+    // `bool` as `u32`, matching the 4 bytes every buffer layout rule gives it.
+    LoweredElementTypeInfo lowerLeafLogicalType(IRType* type, TypeLoweringConfig config) override
+    {
+        if (config.addressSpace == AddressSpace::Uniform ||
+            config.addressSpace == AddressSpace::StorageBuffer)
+        {
+            auto vectorType = as<IRVectorType>(type);
+            if (as<IRBoolType>(vectorType ? vectorType->getElementType() : type))
+            {
+                IRBuilder builder(type);
+                builder.setInsertAfter(type);
+                LoweredElementTypeInfo info = {};
+                info.originalType = type;
+                info.loweredType = builder.getUIntType();
+                if (vectorType)
+                    info.loweredType =
+                        builder.getVectorType(info.loweredType, vectorType->getElementCount());
+                info.convertLoweredToOriginal = kIROp_BuiltinCast;
+                info.convertOriginalToLowered = kIROp_BuiltinCast;
+                return info;
+            }
+        }
+        return DefaultBufferElementTypeLoweringPolicy::lowerLeafLogicalType(type, config);
     }
 };
 

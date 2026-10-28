@@ -37,19 +37,34 @@ __magic_type(DefaultPushConstantDataLayoutType)
 struct DefaultPushConstantDataLayout : IBufferDataLayout
 {};
 
+/// The GLSL `std140` layout. A `ConstantBuffer<T, Std140DataLayout>` has the
+/// same std140 byte layout on SPIR-V, GLSL, HLSL, Metal and WGSL, so one
+/// host-side structure can fill it for every target. HLSL and Metal express
+/// the layout with explicit padding members (and Metal with packed vectors).
 /// @category misc_types
 __intrinsic_type($(kIROp_Std140BufferLayoutType))
 [require(spirv)]
 [require(glsl)]
+[require(hlsl)]
+[require(metal)]
+[require(wgsl)]
 __magic_type(Std140DataLayoutType)
 struct Std140DataLayout : IBufferDataLayout
 {};
 
+/// The GLSL `std430` layout. A `StructuredBuffer<T, Std430DataLayout>` (or its
+/// read-write variants) has the same std430 byte layout on SPIR-V, GLSL, HLSL,
+/// Metal and WGSL, so one host-side structure fills it for every target. HLSL
+/// and Metal express the layout with explicit padding members (and Metal with
+/// packed vectors).
 /// @category misc_types
 __intrinsic_type($(kIROp_Std430BufferLayoutType))
 [require(spirv)]
 [require(glsl)]
 [require(llvm)]
+[require(hlsl)]
+[require(metal)]
+[require(wgsl)]
 __magic_type(Std430DataLayoutType)
 struct Std430DataLayout : IBufferDataLayout
 {};

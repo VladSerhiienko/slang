@@ -320,6 +320,8 @@ FIDDLE(abstract)
 class HLSLStructuredBufferTypeBase : public BuiltinGenericType
 {
     FIDDLE(...)
+    /// The `IBufferDataLayout` argument `L` of `StructuredBuffer<T, L>`.
+    Type* getLayoutType();
 };
 
 FIDDLE()
