@@ -2487,6 +2487,24 @@ struct LoweredElementTypeContext
                         IRCloneEnv cloneEnv = {};
                         builder.setInsertBefore(user);
                         auto originalVal = getStoreVal(user);
+                        if (auto sourceCast = as<IRCastStorageToLogicalDeref>(originalVal))
+                        {
+                            auto sourceInfo = getLoweredTypeInfo(
+                                originalVal->getDataType(),
+                                getTypeLoweringConfigFromInst(sourceCast->getLayoutConfig()));
+                            if (sourceInfo.loweredType != loweredElementTypeInfo.loweredType)
+                            {
+                                // `records[i] = constants` can cross distinct storage
+                                // layouts: a std140 half array has padded elements,
+                                // while std430 stores the same logical array tightly.
+                                // Unpack the source before packing the destination;
+                                // CopyLogical is only for equivalent storage shapes.
+                                originalVal = sourceInfo.convertLoweredToOriginal.apply(
+                                    builder,
+                                    sourceInfo.originalType,
+                                    sourceCast->getVal());
+                            }
+                        }
                         if (auto sbAppend = as<IRStructuredBufferAppend>(user))
                         {
                             builder.setInsertBefore(sbAppend);

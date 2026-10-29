@@ -3,6 +3,7 @@
 #include "slang-compiler.h"
 #include "slang-ir-insts-enum.h"
 #include "slang-ir-insts.h"
+#include "slang-ir-lower-buffer-element-type.h"
 #include "slang-ir-util.h"
 #include "slang-ir.h"
 
@@ -74,8 +75,10 @@ struct MatrixTypeLoweringContext
         }
 
         auto elementType = matrixType->getElementType();
-        return as<IRBoolType>(elementType) || as<IRUIntType>(elementType) ||
-               as<IRIntType>(elementType);
+        // All integer widths need the same array-of-rows representation.
+        // For example, a loaded matrix<int16_t, 2, 3> cannot become an MSL
+        // matrix<short>, just as an int matrix cannot become matrix<int>.
+        return as<IRBoolType>(elementType) || isScalarIntegerType(elementType);
     }
 
     IRInst* legalizeMatrixTypeDeclaration(IRInst* inst)
@@ -726,6 +729,17 @@ void legalizeMatrixTypes(IRModule* module, TargetProgram* targetProgram, Diagnos
     // scan.
     if (!context.hasAnyMatrixToLegalize())
         return;
+
+    if (isMetalTarget(targetProgram->getTargetReq()))
+    {
+        // Preserve a buffer's matrix orientation/stride before logical integer
+        // matrices become arrays of rows. For example, std140 int16_t2x3 has
+        // three 16-byte columns, not the two rows of its logical array value.
+        // Float-only modules keep the ordinary later buffer-lowering boundary.
+        BufferElementTypeLoweringOptions options;
+        options.loweringPolicyKind = BufferElementTypeLoweringPolicyKind::Metal;
+        lowerBufferElementTypeToStorageType(module, targetProgram, options);
+    }
 
     context.processModule();
 }
