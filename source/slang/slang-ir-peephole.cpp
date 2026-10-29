@@ -911,9 +911,17 @@ struct PeepholeContext : InstPassBase
                 for (UInt i = 0; i < opCount; i++)
                 {
                     auto element = inst->getOperand(0)->getOperand(i);
-                    if (auto elementVecType = as<IRVectorType>(element->getDataType()))
+                    IRInst* elementCount = nullptr;
+                    if (auto vectorType = as<IRVectorType>(element->getDataType()))
+                        elementCount = vectorType->getElementCount();
+                    else if (auto packedType = as<IRMetalPackedVectorType>(element->getDataType()))
+                        elementCount = packedType->getElementCount();
+                    // MakeVector also converts packed Metal storage to a logical
+                    // vector. Its packed operand contributes all its components;
+                    // treating it as a scalar replaces element zero with a vector.
+                    if (elementCount)
                     {
-                        auto vecSize = as<IRIntLit>(elementVecType->getElementCount());
+                        auto vecSize = as<IRIntLit>(elementCount);
                         if (!vecSize)
                             break;
                         if (index->getValue() >= startIndex &&

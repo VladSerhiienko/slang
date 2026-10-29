@@ -301,6 +301,10 @@ struct LoweredElementTypeInfo
     IRStructKey* loweredInnerStructKey =
         nullptr; // For matrix/array types that are lowered into a struct type, this is the
                  // struct key of the data field.
+    // A strided matrix column may be a struct containing its packed vector and
+    // padding. Address lowering uses the producer's value-field key to reach
+    // the vector before indexing a scalar or loading/storing a whole row.
+    IRStructKey* loweredMatrixVectorKey = nullptr;
     ConversionMethod convertOriginalToLowered;
     ConversionMethod convertLoweredToOriginal;
 };
@@ -538,12 +542,27 @@ struct StorageStructPadder
     /// A null `type` pads the end of the struct, so that its native size becomes `offset`.
     void padTo(IRIntegerValue offset, IRType* type)
     {
-        auto padType = builder.getUIntType();
-        auto padLayout = getNativeLayout(padType);
         while (nativeOffset < offset)
         {
-            if (offset - nativeOffset < padLayout.size ||
-                getNativePlacement(padLayout) != nativeOffset)
+            // A half member can end two bytes before the next field. Select a
+            // naturally aligned padding scalar that fits the gap, rather than
+            // requiring every field end and every gap to be a multiple of four.
+            IRType* padType = nullptr;
+            IRType* candidates[] = {
+                builder.getUIntType(),
+                builder.getUInt16Type(),
+                builder.getUInt8Type()};
+            for (auto candidate : candidates)
+            {
+                auto layout = getNativeLayout(candidate);
+                if (layout.size <= offset - nativeOffset &&
+                    getNativePlacement(layout) == nativeOffset)
+                {
+                    padType = candidate;
+                    break;
+                }
+            }
+            if (!padType)
             {
                 SLANG_UNEXPECTED("explicit buffer layout cannot be expressed with padding members");
             }
@@ -566,6 +585,68 @@ struct StorageStructPadder
         lastFieldAlignment = layout.alignment;
     }
 };
+
+/// Stores one array element or matrix vector at an explicit stride using a
+/// padded struct. For example, std140 gives a half3 column a 16-byte stride,
+/// but Metal has no buffer-storable half8 vector. Keep its packed_half3 value
+/// and pad the storage struct instead. The logical type remains half3; the
+/// normal storage conversions cross the wrapper at loads and stores.
+static LoweredElementTypeInfo createStridedStorageElement(
+    TargetProgram* target,
+    TypeLoweringConfig config,
+    IRTypeLayoutRules* nativeRules,
+    LoweredElementTypeInfo elementInfo,
+    IRIntegerValue stride,
+    IRStructKey** valueKey = nullptr)
+{
+    IRBuilder builder(elementInfo.loweredType);
+    builder.setInsertAfter(elementInfo.loweredType);
+    auto storageType = builder.createStructType();
+    maybeAddPhysicalTypeDecoration(builder, storageType, config);
+    builder.addNameHintDecoration(storageType, UnownedStringSlice("_StridedStorage"));
+    auto key = builder.createStructKey();
+    if (valueKey)
+        *valueKey = key;
+    builder.addNameHintDecoration(key, UnownedStringSlice("value"));
+    builder.createStructField(storageType, key, elementInfo.loweredType);
+    StorageStructPadder padder(target->getTargetReq(), nativeRules, builder, storageType);
+    padder.advancePast(elementInfo.loweredType);
+    padder.padTo(stride, nullptr);
+
+    LoweredElementTypeInfo result = {};
+    result.originalType = elementInfo.originalType;
+    result.loweredType = storageType;
+    IRType* refType = builder.getRefParamType(storageType, AddressSpace::Generic);
+    auto unpack = builder.createFunc();
+    unpack->setFullType(builder.getFuncType(1, &refType, elementInfo.originalType));
+    builder.addNameHintDecoration(unpack, UnownedStringSlice("unpackStridedStorage"));
+    builder.addForceInlineDecoration(unpack);
+    builder.setInsertInto(unpack);
+    builder.emitBlock();
+    auto valueAddress = builder.emitFieldAddress(builder.emitParam(refType), key);
+    builder.emitReturn(elementInfo.convertLoweredToOriginal
+                           .apply(builder, elementInfo.originalType, valueAddress));
+    result.convertLoweredToOriginal = unpack;
+
+    builder.setInsertAfter(unpack);
+    auto pack = builder.createFunc();
+    IRType* paramTypes[] = {refType, elementInfo.originalType};
+    pack->setFullType(builder.getFuncType(2, paramTypes, builder.getVoidType()));
+    builder.addNameHintDecoration(pack, UnownedStringSlice("packStridedStorage"));
+    builder.addForceInlineDecoration(pack);
+    builder.setInsertInto(pack);
+    builder.emitBlock();
+    auto dest = builder.emitParam(refType);
+    auto value = builder.emitParam(elementInfo.originalType);
+    builder.emitStore(dest, builder.emitDefaultConstruct(storageType));
+    elementInfo.convertOriginalToLowered.applyDestinationDriven(
+        builder,
+        builder.emitFieldAddress(dest, key),
+        value);
+    builder.emitReturn();
+    result.convertOriginalToLowered = pack;
+    return result;
+}
 
 struct LoweredElementTypeContext
 {
@@ -906,7 +987,26 @@ struct LoweredElementTypeContext
         {
             auto loweredInnerTypeInfo = getLoweredTypeInfo(arrayTypeBase->getElementType(), config);
 
-            if (auto widenedCount = getWidenedArrayElementCount(loweredInnerTypeInfo, config))
+            auto widenedCount = getWidenedArrayElementCount(loweredInnerTypeInfo, config);
+            if (widenedCount > 4 && isMetalTarget(target->getTargetReq()))
+            {
+                loweredInnerTypeInfo = createStridedStorageElement(
+                    target,
+                    config,
+                    leafTypeLoweringPolicy->getNativeStorageLayoutRules(config),
+                    loweredInnerTypeInfo,
+                    getElementLayout(config.getLayoutRule(), loweredInnerTypeInfo.originalType)
+                        .getStride());
+                conversionMethodMap[{
+                    loweredInnerTypeInfo.originalType,
+                    loweredInnerTypeInfo.loweredType}] =
+                    loweredInnerTypeInfo.convertLoweredToOriginal;
+                conversionMethodMap[{
+                    loweredInnerTypeInfo.loweredType,
+                    loweredInnerTypeInfo.originalType}] =
+                    loweredInnerTypeInfo.convertOriginalToLowered;
+            }
+            else if (widenedCount)
             {
                 // Some layouts need array elements stored in wider vectors: a std140 constant
                 // buffer on a target that requires 16-byte array strides, or an explicit layout
@@ -2584,8 +2684,16 @@ struct LoweredElementTypeContext
         // vectors rather than ordinary vectors, so whole-row loads/stores need
         // a conversion between the row vector and its packed-vector storage.
         IRMetalPackedVectorType* minorPackedType = nullptr;
+        IRType* minorStorageType = nullptr;
         if (auto innerArrayType = as<IRArrayTypeBase>(matrixTypeInfo->loweredInnerArrayType))
-            minorPackedType = as<IRMetalPackedVectorType>(innerArrayType->getElementType());
+        {
+            IRType* vectorType = innerArrayType->getElementType();
+            if (matrixTypeInfo->loweredMatrixVectorKey)
+                vectorType = findStructField(vectorType, matrixTypeInfo->loweredMatrixVectorKey)
+                                 ->getFieldType();
+            minorPackedType = as<IRMetalPackedVectorType>(vectorType);
+            minorStorageType = vectorType;
+        }
         traverseUses(
             majorAddr,
             [&](IRUse* use)
@@ -2608,8 +2716,21 @@ struct LoweredElementTypeContext
                             List<IRInst*> args;
                             for (IRIntegerValue i = 0; i < colCount; i++)
                             {
-                                auto vector =
-                                    builder.emitLoad(builder.emitElementAddress(dataPtr, i));
+                                auto vectorAddr = builder.emitElementAddress(dataPtr, i);
+                                if (matrixTypeInfo->loweredMatrixVectorKey)
+                                    vectorAddr = builder.emitFieldAddress(
+                                        vectorAddr,
+                                        matrixTypeInfo->loweredMatrixVectorKey);
+                                auto vector = builder.emitLoad(vectorAddr);
+                                if (minorPackedType)
+                                {
+                                    // Cross the packed-storage boundary before
+                                    // reconstructing a logical matrix row.
+                                    auto vectorType = builder.getVectorType(
+                                        matrixType->getElementType(),
+                                        getIntVal(matrixType->getRowCount()));
+                                    vector = builder.emitMakeVector(vectorType, 1, &vector);
+                                }
                                 auto element =
                                     builder.emitElementExtract(vector, majorGEP->getIndex());
                                 args.add(element);
@@ -2624,6 +2745,10 @@ struct LoweredElementTypeContext
                         {
                             auto element =
                                 builder.emitElementAddress(dataPtr, majorGEP->getIndex());
+                            if (matrixTypeInfo->loweredMatrixVectorKey)
+                                element = builder.emitFieldAddress(
+                                    element,
+                                    matrixTypeInfo->loweredMatrixVectorKey);
                             resultInst = builder.emitLoad(element);
                             if (minorPackedType)
                             {
@@ -2632,6 +2757,13 @@ struct LoweredElementTypeContext
                                 auto vectorType = as<IRVectorType>(user->getDataType());
                                 SLANG_ASSERT(vectorType);
                                 resultInst = builder.emitMakeVector(vectorType, 1, &resultInst);
+                            }
+                            else if (resultInst->getDataType() != user->getDataType())
+                            {
+                                // Explicit strides may widen a row (half3 to half4).
+                                // Padding components are not part of the logical row.
+                                resultInst =
+                                    builder.emitVectorReshape(user->getDataType(), resultInst);
                             }
                         }
                         user->replaceUsesWith(resultInst);
@@ -2654,6 +2786,10 @@ struct LoweredElementTypeContext
                             for (IRIntegerValue i = 0; i < colCount; i++)
                             {
                                 auto vectorAddr = builder.emitElementAddress(dataPtr, i);
+                                if (matrixTypeInfo->loweredMatrixVectorKey)
+                                    vectorAddr = builder.emitFieldAddress(
+                                        vectorAddr,
+                                        matrixTypeInfo->loweredMatrixVectorKey);
                                 auto elementAddr =
                                     builder.emitElementAddress(vectorAddr, majorGEP->getIndex());
                                 builder.emitStore(
@@ -2666,12 +2802,20 @@ struct LoweredElementTypeContext
                         {
                             auto rowAddr =
                                 builder.emitElementAddress(dataPtr, majorGEP->getIndex());
+                            if (matrixTypeInfo->loweredMatrixVectorKey)
+                                rowAddr = builder.emitFieldAddress(
+                                    rowAddr,
+                                    matrixTypeInfo->loweredMatrixVectorKey);
                             IRInst* value = storeInst->getVal();
                             if (minorPackedType)
                             {
                                 // Convert the logical row vector to its packed
                                 // storage form (MSL `packed_float3(float3)`).
                                 value = builder.emitMakeVector(minorPackedType, 1, &value);
+                            }
+                            else if (minorStorageType != value->getDataType())
+                            {
+                                value = builder.emitVectorReshape(minorStorageType, value);
                             }
                             builder.emitStore(rowAddr, value);
                             user->removeAndDeallocate();
@@ -2694,14 +2838,19 @@ struct LoweredElementTypeContext
                             storageBase,
                             matrixTypeInfo->loweredInnerStructKey);
                         auto vectorAddr = builder.emitElementAddress(dataPtr, rowIndex);
+                        if (matrixTypeInfo->loweredMatrixVectorKey)
+                            vectorAddr = builder.emitFieldAddress(
+                                vectorAddr,
+                                matrixTypeInfo->loweredMatrixVectorKey);
                         auto elementAddr = builder.emitElementAddress(vectorAddr, colIndex);
                         gep2->replaceUsesWith(elementAddr);
                         gep2->removeAndDeallocate();
                         break;
                     }
                 default:
-                    SLANG_UNREACHABLE("unhandled inst of a matrix address inst that needs "
-                                      "storage lowering.");
+                    SLANG_UNREACHABLE(
+                        "unhandled inst of a matrix address inst that needs "
+                        "storage lowering.");
                     break;
                 }
             });
@@ -3043,7 +3192,8 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
     IRFunc* createMatrixUnpackFunc(
         IRMatrixType* matrixType,
         IRStructType* structType,
-        IRStructKey* dataKey)
+        IRStructKey* dataKey,
+        LoweredElementTypeInfo* storageVector = nullptr)
     {
         IRBuilder builder(structType);
         builder.setInsertAfter(structType);
@@ -3067,6 +3217,13 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
             for (IRIntegerValue c = 0; c < colCount; c++)
             {
                 auto vector = builder.emitElementExtract(vectorArray, c);
+                if (storageVector)
+                    vector = storageVector->convertLoweredToOriginal.apply(
+                        builder,
+                        storageVector->originalType,
+                        builder.emitElementAddress(
+                            builder.emitFieldAddress(packedParamRef, dataKey),
+                            c));
                 for (IRIntegerValue r = 0; r < rowCount; r++)
                 {
                     auto element = builder.emitElementExtract(vector, r);
@@ -3079,6 +3236,13 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
             for (IRIntegerValue r = 0; r < rowCount; r++)
             {
                 auto vector = builder.emitElementExtract(vectorArray, r);
+                if (storageVector)
+                    vector = storageVector->convertLoweredToOriginal.apply(
+                        builder,
+                        storageVector->originalType,
+                        builder.emitElementAddress(
+                            builder.emitFieldAddress(packedParamRef, dataKey),
+                            r));
                 for (IRIntegerValue c = 0; c < colCount; c++)
                 {
                     auto element = builder.emitElementExtract(vector, c);
@@ -3096,7 +3260,8 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
         IRMatrixType* matrixType,
         IRStructType* structType,
         IRVectorType* vectorType,
-        IRArrayType* arrayType)
+        IRArrayType* arrayType,
+        LoweredElementTypeInfo* storageVector = nullptr)
     {
         IRBuilder builder(structType);
         builder.setInsertAfter(structType);
@@ -3144,6 +3309,15 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                     vectorType,
                     (UInt)vecArgs.getCount(),
                     vecArgs.getBuffer());
+                if (storageVector)
+                {
+                    auto stored = builder.emitVar(storageVector->loweredType);
+                    storageVector->convertOriginalToLowered.applyDestinationDriven(
+                        builder,
+                        stored,
+                        colVector);
+                    colVector = builder.emitLoad(stored);
+                }
                 vectors.add(colVector);
             }
         }
@@ -3166,6 +3340,15 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                     vectorType,
                     (UInt)vecArgs.getCount(),
                     vecArgs.getBuffer());
+                if (storageVector)
+                {
+                    auto stored = builder.emitVar(storageVector->loweredType);
+                    storageVector->convertOriginalToLowered.applyDestinationDriven(
+                        builder,
+                        stored,
+                        rowVector);
+                    rowVector = builder.emitLoad(stored);
+                }
                 vectors.add(rowVector);
             }
         }
@@ -3215,6 +3398,7 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
             auto structKey = builder.createStructKey();
             builder.addNameHintDecoration(structKey, UnownedStringSlice("data"));
             auto vectorSize = isColMajor ? matrixType->getRowCount() : matrixType->getColumnCount();
+            auto logicalVectorSize = vectorSize;
             if (config.layoutRuleName == IRTypeLayoutRuleName::Std140 &&
                 shouldTranslateArrayElementTo16ByteAlignedVectorForConstantBuffer())
             {
@@ -3233,7 +3417,11 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                     config));
             }
 
-            auto vectorType = builder.getVectorType(matrixType->getElementType(), vectorSize);
+            const bool needsPaddedVector =
+                isMetalTarget(target->getTargetReq()) && getIntVal(vectorSize) > 4;
+            auto vectorType = builder.getVectorType(
+                matrixType->getElementType(),
+                needsPaddedVector ? logicalVectorSize : vectorSize);
             IRSizeAndAlignment elementSizeAlignment;
             getSizeAndAlignment(
                 target->getTargetReq(),
@@ -3243,8 +3431,21 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
             elementSizeAlignment =
                 config.getLayoutRule()->alignCompositeElement(elementSizeAlignment);
 
+            LoweredElementTypeInfo storageVector = {};
+            IRType* arrayElementType = vectorType;
+            if (needsPaddedVector)
+            {
+                storageVector = createStridedStorageElement(
+                    target,
+                    config,
+                    getNativeStorageLayoutRules(config),
+                    lowerLeafLogicalType(vectorType, config),
+                    elementSizeAlignment.getStride(),
+                    &info.loweredMatrixVectorKey);
+                arrayElementType = storageVector.loweredType;
+            }
             auto arrayType = builder.getArrayType(
-                vectorType,
+                arrayElementType,
                 isColMajor ? matrixType->getColumnCount() : matrixType->getRowCount(),
                 needExplicitLayout
                     ? builder.getIntValue(builder.getUIntType(), elementSizeAlignment.getStride())
@@ -3254,10 +3455,17 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
             info.loweredType = loweredType;
             info.loweredInnerArrayType = arrayType;
             info.loweredInnerStructKey = structKey;
-            info.convertLoweredToOriginal =
-                createMatrixUnpackFunc(matrixType, loweredType, structKey);
-            info.convertOriginalToLowered =
-                createMatrixPackFunc(matrixType, loweredType, vectorType, arrayType);
+            info.convertLoweredToOriginal = createMatrixUnpackFunc(
+                matrixType,
+                loweredType,
+                structKey,
+                needsPaddedVector ? &storageVector : nullptr);
+            info.convertOriginalToLowered = createMatrixPackFunc(
+                matrixType,
+                loweredType,
+                vectorType,
+                arrayType,
+                needsPaddedVector ? &storageVector : nullptr);
             return info;
         }
 
