@@ -730,14 +730,17 @@ void legalizeMatrixTypes(IRModule* module, TargetProgram* targetProgram, Diagnos
     if (!context.hasAnyMatrixToLegalize())
         return;
 
-    if (isMetalTarget(targetProgram->getTargetReq()))
+    if (isMetalTarget(targetProgram->getTargetReq()) ||
+        isKhronosTarget(targetProgram->getTargetReq()))
     {
         // Preserve a buffer's matrix orientation/stride before logical integer
         // matrices become arrays of rows. For example, std140 int16_t2x3 has
         // three 16-byte columns, not the two rows of its logical array value.
         // Float-only modules keep the ordinary later buffer-lowering boundary.
         BufferElementTypeLoweringOptions options;
-        options.loweringPolicyKind = BufferElementTypeLoweringPolicyKind::Metal;
+        options.loweringPolicyKind = isMetalTarget(targetProgram->getTargetReq())
+                                         ? BufferElementTypeLoweringPolicyKind::Metal
+                                         : BufferElementTypeLoweringPolicyKind::KhronosTarget;
         lowerBufferElementTypeToStorageType(module, targetProgram, options);
     }
 

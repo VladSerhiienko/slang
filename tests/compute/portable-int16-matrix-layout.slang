@@ -1,6 +1,8 @@
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-mtl -compute -shaderobj -output-using-type
+//TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-vk -compute -shaderobj -output-using-type
+//TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-d3d12 -compute -shaderobj -output-using-type
 // Non-square integer matrices keep their column-major buffer layout while
-// logical matrix loads/stores lower to Metal's supported arrays of row vectors.
+// logical matrix loads/stores lower to arrays of row vectors where required.
 struct Data
 {
     column_major matrix<int16_t, 2, 3> signedMatrix;

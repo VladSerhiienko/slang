@@ -3510,6 +3510,12 @@ struct KhronosTargetBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLo
 
     virtual bool shouldLowerMatrixType(IRMatrixType* matrixType, TypeLoweringConfig config) override
     {
+        // SPIR-V has no native integer/bool matrices. Preserve the physical
+        // column vectors before logical matrix legalization turns them into
+        // row arrays (which have different strides and sometimes sizes).
+        auto elementType = matrixType->getElementType();
+        if (as<IRBoolType>(elementType) || isScalarIntegerType(elementType))
+            return true;
         // For spirv, we generally want to lower all matrix types, because SPIRV does not support
         // specifying matrix layout/stride if the matrix type is used in places other than
         // defining a struct field. This means that if a matrix is used to define a varying
