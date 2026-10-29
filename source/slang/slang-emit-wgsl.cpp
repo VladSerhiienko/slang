@@ -1801,6 +1801,15 @@ bool WGSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
 
 void WGSLSourceEmitter::emitVectorTypeNameImpl(IRType* elementType, IRIntegerValue elementCount)
 {
+    // Buffer lowering widens each element of a 16-bit array or matrix in a std140 uniform
+    // buffer to a 16-byte vector, eight components for `half`. WGSL vectors have at most
+    // four components and no 16-bit integer type to pad with, so such a buffer has no WGSL
+    // form; we report it rather than emit a `vec8` that WGSL rejects.
+    if (elementCount > 4)
+    {
+        diagnoseOnce(Diagnostics::VectorTooWideForWgsl{.count = elementCount});
+        return;
+    }
 
     if (elementCount > 1)
     {

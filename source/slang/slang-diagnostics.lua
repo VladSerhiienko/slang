@@ -6199,7 +6199,7 @@ err(
 -- Load semantic checking diagnostics (part 15) - Target code generation and platform-specific diagnostics
 -- (inlined from slang-diagnostics-semantic-checking-15.lua)
 
--- Metal or WGSL (56101-56109)
+-- Metal or WGSL (56101-56110)
 
 err(
     "resource-types-in-constant-buffer-in-parameter-block-not-allowed-on-metal",
@@ -6262,6 +6262,13 @@ err(
     56109,
     "SubpassInput in ParameterBlock not supported on Metal",
     span { loc = "location", message = "SubpassInput cannot be placed inside a ParameterBlock on Metal; framebuffer fetch inputs must be direct entry-point parameters." }
+)
+
+err(
+    "vector-too-wide-for-wgsl",
+    56110,
+    "~count:Int-component vector not supported in WGSL",
+    span { loc = "location", message = "WGSL vectors have at most 4 components, but this buffer layout needs vectors of ~count:Int components: a uniform buffer gives each element of a 16-bit array or matrix a 16-byte stride. Check the target at compile time and use 32-bit types or a storage buffer for this data on WGSL." }
 )
 
 -- SPIRV (57001-57007)
